@@ -34,12 +34,9 @@ func IngestPlayer(ctx context.Context, pool *pgxpool.Pool, resp *apiclient.Playe
 
 	bucket := domain.BucketForTrophies(resp.Trophies)
 
-	// Load current patch ID (best-effort; nil if not configured).
-	patchID, _ := queries.CurrentPatchID(ctx, pool)
-	var patchIDPtr *int
-	if patchID > 0 {
-		patchIDPtr = &patchID
-	}
+	// Look up the patch active at snapshot time (best-effort; nil if none found).
+	snapshotAt := time.Now().UTC()
+	patchIDPtr, _ := queries.PatchIDForTime(ctx, pool, snapshotAt)
 
 	var clubTag, clubName *string
 	if resp.Club != nil {
@@ -51,7 +48,7 @@ func IngestPlayer(ctx context.Context, pool *pgxpool.Pool, resp *apiclient.Playe
 	snapshotID, err := queries.InsertPlayerSnapshot(ctx, pool, queries.PlayerSnapshotParams{
 		// NOTE: returns 0 if snapshot already exists at this exact timestamp (extremely rare)
 		PlayerTag:       normalTag,
-		SnapshotAt:      time.Now().UTC(),
+		SnapshotAt:      snapshotAt,
 		PatchID:         patchIDPtr,
 		Trophies:        resp.Trophies,
 		HighestTrophies: resp.HighestTrophies,

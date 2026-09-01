@@ -15,9 +15,8 @@ import (
 
 // BattleIngestor writes battle log entries to the database with deduplication.
 type BattleIngestor struct {
-	pool            *pgxpool.Pool
-	patchID         *int    // cached current patch ID; nil if not yet loaded
-	discovererTag   string  // normalized tag of the player whose log we're processing
+	pool          *pgxpool.Pool
+	discovererTag string // normalized tag of the player whose log we're processing
 }
 
 // NewBattleIngestor creates an ingestor. discovererTag is the player whose battle
@@ -60,10 +59,12 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 		return IngestResult{}, fmt.Errorf("upsert event: %w", err)
 	}
 
-	// Load patch ID if not already cached.
-	if err := b.ensurePatchID(ctx); err != nil {
+	// Look up which patch was active when this battle occurred.
+	// Returns nil (no error) if no patch predates the battle time - stored as NULL.
+	patchID, err := queries.PatchIDForTime(ctx, b.pool, battleTime)
+	if err != nil {
 		// Non-fatal: proceed with nil patch ID. The battle will have patch_id = NULL.
-		log.Printf("warning: could not load current patch ID: %v", err)
+		log.Printf("warning: could not look up patch for battle at %s: %v", battleTime.Format("2006-01-02"), err)
 	}
 
 	// Serialize the raw battle object for storage.
@@ -87,7 +88,6 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 	}
 
 	// Insert the battle row.
-	patchIDPtr := b.patchID
 	eventIDPtr := &eventID
 	discovererNorm := b.discovererTag
 
@@ -100,7 +100,7 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 		BattleType:             entry.Battle.Type,
 		DurationSeconds:        nullableInt(entry.Battle.Duration),
 		StarPlayerTag:          starPlayerTag,
-		PatchID:                patchIDPtr,
+		PatchID:                patchID,
 		TrophyChange:           entry.Battle.TrophyChange,
 		TrophyChangePlayerTag:  &discovererNorm,
 		DiscoveredViaPlayerTag: &discovererNorm,
@@ -110,35 +110,47 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 		return IngestResult{}, fmt.Errorf("insert battle: %w", err)
 	}
 
-	// Insert teams and participants (idempotent regardless of IsNew).
+	// Insert teams and participants only on first encounter.
+	// Team array ordering may differ between observers, so we never overwrite
+	// team/participant data written by the first discoverer.
+	// Player discovery runs regardless of IsNew so we don't miss teammates
+	// encountered from a different perspective.
 	var newDiscoveries []string
 	for teamIdx, team := range entry.Battle.Teams {
-		teamResult := teamResults[teamIdx]
-		teamID, err := queries.InsertBattleTeam(ctx, b.pool, bResult.BattleID, teamIdx, teamResult)
-		if err != nil {
-			return IngestResult{}, fmt.Errorf("insert team %d: %w", teamIdx, err)
+		var teamID int64
+		if bResult.IsNew {
+			teamResult := teamResults[teamIdx]
+			var err error
+			teamID, err = queries.InsertBattleTeam(ctx, b.pool, bResult.BattleID, teamIdx, teamResult)
+			if err != nil {
+				return IngestResult{}, fmt.Errorf("insert team %d: %w", teamIdx, err)
+			}
 		}
 
 		for _, p := range team {
 			normalTag := apiclient.NormalizeTag(p.Tag)
-			isStarPlayer := starPlayerTag != nil && *starPlayerTag == normalTag
-			bucket := domain.BucketForTrophies(p.Brawler.Trophies)
 
-			if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
-				BattleID:        bResult.BattleID,
-				TeamID:          teamID,
-				PlayerTag:       normalTag,
-				PlayerName:      p.Name,
-				BrawlerID:       p.Brawler.ID,
-				BrawlerPower:    p.Brawler.Power,
-				BrawlerTrophies: p.Brawler.Trophies,
-				IsStarPlayer:    isStarPlayer,
-				TrophyBucket:    int16(bucket),
-			}); err != nil {
-				return IngestResult{}, fmt.Errorf("insert participant %s: %w", normalTag, err)
+			if bResult.IsNew {
+				isStarPlayer := starPlayerTag != nil && *starPlayerTag == normalTag
+				bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+				if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
+					BattleID:        bResult.BattleID,
+					TeamID:          teamID,
+					PlayerTag:       normalTag,
+					PlayerName:      p.Name,
+					BrawlerID:       p.Brawler.ID,
+					BrawlerPower:    p.Brawler.Power,
+					BrawlerTrophies: p.Brawler.Trophies,
+					IsStarPlayer:    isStarPlayer,
+					TrophyBucket:    int16(bucket),
+				}); err != nil {
+					return IngestResult{}, fmt.Errorf("insert participant %s: %w", normalTag, err)
+				}
 			}
 
-			// Discover new players for the crawl queue.
+			// Discover new players for the crawl queue regardless of whether
+			// the battle is new. Trophy estimate is NULL: we only know brawler
+			// trophies here, not the player's total. The profile fetch will fill this.
 			if normalTag != b.discovererTag {
 				if ok, err := b.shouldEnqueue(ctx, normalTag); err != nil {
 					log.Printf("warning: check enqueue %s: %v", normalTag, err)
@@ -146,7 +158,7 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 					if err := queries.EnqueueDiscoveredPlayer(ctx, b.pool,
 						normalTag, p.Name,
 						"battle_discovery", b.discovererTag,
-						p.Brawler.Trophies, int16(bucket),
+						nil, nil,
 					); err != nil {
 						log.Printf("warning: enqueue %s: %v", normalTag, err)
 					} else {
@@ -162,19 +174,6 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 		IsNew:          bResult.IsNew,
 		NewDiscoveries: newDiscoveries,
 	}, nil
-}
-
-// ensurePatchID loads the current patch ID into the cache if not already set.
-func (b *BattleIngestor) ensurePatchID(ctx context.Context) error {
-	if b.patchID != nil {
-		return nil
-	}
-	id, err := queries.CurrentPatchID(ctx, b.pool)
-	if err != nil {
-		return err
-	}
-	b.patchID = &id
-	return nil
 }
 
 // shouldEnqueue checks whether a discovered player tag should be added to the crawl queue.
