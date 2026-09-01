@@ -123,7 +123,10 @@ type BrawlerSnapshotParams struct {
 
 // EnqueueDiscoveredPlayer adds a newly discovered player tag to the crawl queue.
 // No-ops if the player is already in the queue.
-func EnqueueDiscoveredPlayer(ctx context.Context, pool *pgxpool.Pool, tag, name, discoverySource, discoveryVia string, trophyEstimate int, trophyBucket int16) error {
+// trophyEstimate and trophyBucket should be nil for battle-discovered players:
+// we only know brawler trophies at that point, not the player's total. The
+// profile fetch will fill these in when the player is crawled.
+func EnqueueDiscoveredPlayer(ctx context.Context, pool *pgxpool.Pool, tag, name, discoverySource, discoveryVia string, trophyEstimate *int, trophyBucket *int16) error {
 	_, err := pool.Exec(ctx, `
 		INSERT INTO players (tag, name, first_seen_at)
 		VALUES ($1, $2, NOW())
