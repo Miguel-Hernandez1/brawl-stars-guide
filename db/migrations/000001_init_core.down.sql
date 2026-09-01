@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS battle_participants;
+DROP TABLE IF EXISTS battle_teams;
+DROP TABLE IF EXISTS battles;
+DROP TABLE IF EXISTS player_brawler_snapshots;
+DROP TABLE IF EXISTS player_snapshots;
+DROP TABLE IF EXISTS players;
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS balance_changes;
+DROP TABLE IF EXISTS patches;
+DROP TABLE IF EXISTS brawlers;
