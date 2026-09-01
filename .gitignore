@@ -1,0 +1,54 @@
+# Session continuity - local only, never committed
+CLAUDE_CATCHUP.md
+
+# Environment secrets
+.env
+.env.local
+*.env.local
+
+# Go build artifacts
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test cache and coverage
+*.test
+*.out
+coverage.html
+
+# Go workspace (we use a single go.mod)
+go.work
+go.work.sum
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.venv/
+venv/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Docker
+*.log
