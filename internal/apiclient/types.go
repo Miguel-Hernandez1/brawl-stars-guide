@@ -22,15 +22,15 @@ type PlayerClub struct {
 }
 
 type PlayerBrawler struct {
-	ID              int           `json:"id"`
-	Name            string        `json:"name"`
-	Power           int           `json:"power"`
-	Rank            int           `json:"rank"`
-	Trophies        int           `json:"trophies"`
-	HighestTrophies int           `json:"highestTrophies"`
-	StarPowers      []StarPower   `json:"starPowers"`
-	Gadgets         []Gadget      `json:"gadgets"`
-	Gears           []Gear        `json:"gears"`
+	ID              int         `json:"id"`
+	Name            string      `json:"name"`
+	Power           int         `json:"power"`
+	Rank            int         `json:"rank"`
+	Trophies        int         `json:"trophies"`
+	HighestTrophies int         `json:"highestTrophies"`
+	StarPowers      []StarPower `json:"starPowers"`
+	Gadgets         []Gadget    `json:"gadgets"`
+	Gears           []Gear      `json:"gears"`
 }
 
 type StarPower struct {
@@ -84,17 +84,19 @@ type BattleData struct {
 	TrophyChange *int `json:"trophyChange"`
 	// StarPlayer is the top performer, identified by tag. Not perspective-dependent.
 	StarPlayer *BattleParticipant `json:"starPlayer"`
-	// Teams is a 2D slice: [team_index][player_index].
-	// For 3v3 modes: 2 teams of 3. For showdown: structure varies - verify on first batch.
+	// Teams is a 2D slice: [team_index][player_index]. Present in 3v3 modes.
 	Teams [][]BattleParticipant `json:"teams"`
-	// Rank is the finishing position in modes with rankings (e.g. showdown).
+	// Players is a flat participant list used in Showdown-style modes instead of Teams.
+	// A battle entry has either Teams or Players, not both.
+	Players []BattleParticipant `json:"players"`
+	// Rank is the finishing position in modes with rankings (e.g. Showdown).
 	Rank *int `json:"rank"`
 }
 
 type BattleParticipant struct {
-	Tag    string              `json:"tag"`
-	Name   string              `json:"name"`
-	Brawler BrawlerInBattle    `json:"brawler"`
+	Tag     string          `json:"tag"`
+	Name    string          `json:"name"`
+	Brawler BrawlerInBattle `json:"brawler"`
 }
 
 // BrawlerInBattle is the brawler snapshot within a battle log entry.
