@@ -1,10 +1,6 @@
 ROOT := $(shell pwd)
 
-# Load .env if it exists (never committed; see .env.example)
--include .env
-export
-
-.PHONY: dev test build collect migrate-up migrate-down seed-brawlers psql lint
+.PHONY: dev test test-verbose build collect migrate-up migrate-down seed-brawlers psql lint help
 
 ## dev: start local PostgreSQL via docker compose
 dev:
@@ -25,19 +21,27 @@ build:
 
 ## migrate-up: apply all pending database migrations (run from project root)
 migrate-up:
-	go run ./collector/cmd/collector migrate up
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./collector/cmd/collector migrate up
 
 ## migrate-down: roll back the last database migration
 migrate-down:
-	go run ./collector/cmd/collector migrate down
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./collector/cmd/collector migrate down
 
 ## seed-brawlers: populate the brawlers reference table from the API
 seed-brawlers:
-	go run ./collector/cmd/collector seed brawlers
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./collector/cmd/collector seed brawlers
 
-## collect: ingest a player - usage: make collect tag=#YOURTAG
+## collect: ingest a player's profile and battle log
+##   TAG='#2UCCRJ280P' make collect   (hash preserved via env var)
+##   make collect tag=2UCCRJ280P       (hash prefix is optional; binary normalizes the tag)
+##   Note: 'make collect tag=#...' does not work - Make treats # as a comment.
+##   Use the TAG env-var form when the leading hash matters.
 collect:
-	go run ./collector/cmd/collector collect player $(tag)
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./collector/cmd/collector collect player "$${TAG:-$(tag)}"
 
 ## psql: open a psql shell to the local dev database
 psql:
@@ -47,6 +51,6 @@ psql:
 lint:
 	go vet ./...
 
-## help: list targets
+## help: list available targets
 help:
 	@grep -E '^## ' Makefile | sed 's/## //'
