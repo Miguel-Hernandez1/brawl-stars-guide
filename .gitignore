@@ -1,7 +1,3 @@
-# Local-only AI collaborator working files - never committed
-CLAUDE.md
-CLAUDE_CATCHUP.md
-
 # Environment secrets
 .env
 .env.local
