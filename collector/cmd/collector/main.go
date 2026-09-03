@@ -4,12 +4,14 @@
 //
 //	collector collect player <tag>   - fetch and ingest one player's profile + battle log
 //	collector seed brawlers          - populate the brawlers reference table from the API
+//	collector repair showdown        - write participant rows for deferred Solo Showdown battles
 //	collector migrate up             - apply all pending database migrations
 //	collector migrate down           - roll back the last migration
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -21,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/apiclient"
+	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/domain"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/ingestion"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage/queries"
@@ -54,6 +57,14 @@ func main() {
 			log.Fatalf("unknown seed subcommand: %s", sub)
 		}
 
+	case "repair":
+		switch sub {
+		case "showdown":
+			runRepairShowdown()
+		default:
+			log.Fatalf("unknown repair subcommand: %s", sub)
+		}
+
 	case "migrate":
 		switch sub {
 		case "up":
@@ -75,6 +86,7 @@ func usage() {
 Commands:
   collect player <tag>   Ingest a player's profile and battle log
   seed brawlers          Populate the brawlers reference table
+  repair showdown        Write participant rows for deferred Solo Showdown battles
   migrate up             Apply pending database migrations
   migrate down           Roll back the last migration
 
@@ -222,6 +234,76 @@ func mustDBPool(ctx context.Context) *pgxpool.Pool {
 		log.Fatalf("connect to database: %v", err)
 	}
 	return pool
+}
+
+// runRepairShowdown writes participant rows for Solo Showdown battles that have none.
+// Uses raw_battle_data already stored in the battles table - no API calls needed.
+// Safe to run multiple times: InsertBattleParticipant uses ON CONFLICT DO NOTHING.
+func runRepairShowdown() {
+	ctx := context.Background()
+	pool := mustDBPool(ctx)
+	defer pool.Close()
+
+	rows, err := pool.Query(ctx, `
+		SELECT b.id, b.raw_battle_data
+		FROM battles b
+		WHERE b.event_mode = 'soloShowdown'
+		  AND NOT EXISTS (SELECT 1 FROM battle_participants bp WHERE bp.battle_id = b.id)
+		ORDER BY b.id
+	`)
+	if err != nil {
+		log.Fatalf("query deferred showdown battles: %v", err)
+	}
+	defer rows.Close()
+
+	type deferred struct {
+		battleID int64
+		rawJSON  []byte
+	}
+	var battles []deferred
+	for rows.Next() {
+		var d deferred
+		if err := rows.Scan(&d.battleID, &d.rawJSON); err != nil {
+			log.Fatalf("scan row: %v", err)
+		}
+		battles = append(battles, d)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("iterate rows: %v", err)
+	}
+
+	log.Printf("found %d Solo Showdown battles with no participant rows", len(battles))
+
+	repaired, inserted := 0, 0
+	for _, b := range battles {
+		var entry apiclient.BattleEntry
+		if err := json.Unmarshal(b.rawJSON, &entry); err != nil {
+			log.Printf("warning: battle %d: unmarshal: %v", b.battleID, err)
+			continue
+		}
+		for _, p := range entry.Battle.Players {
+			normalTag := apiclient.NormalizeTag(p.Tag)
+			bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+			if err := queries.InsertBattleParticipant(ctx, pool, queries.ParticipantParams{
+				BattleID:        b.battleID,
+				TeamID:          nil,
+				PlayerTag:       normalTag,
+				PlayerName:      p.Name,
+				BrawlerID:       p.Brawler.ID,
+				BrawlerPower:    p.Brawler.Power,
+				BrawlerTrophies: p.Brawler.Trophies,
+				IsStarPlayer:    false,
+				TrophyBucket:    int16(bucket),
+			}); err != nil {
+				log.Printf("warning: battle %d participant %s: %v", b.battleID, normalTag, err)
+				continue
+			}
+			inserted++
+		}
+		repaired++
+	}
+
+	log.Printf("repaired %d battles, inserted %d participant rows", repaired, inserted)
 }
 
 // mustEnv returns the env var value or the provided default.
