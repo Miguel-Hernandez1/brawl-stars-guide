@@ -3,6 +3,7 @@ package apiclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -67,39 +68,30 @@ func (e *APIError) Error() string {
 
 // IsNotFound reports whether err is a 404 from the API.
 func IsNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	e, ok := err.(*APIError)
-	return ok && e.StatusCode == http.StatusNotFound
+	var e *APIError
+	return errors.As(err, &e) && e.StatusCode == http.StatusNotFound
 }
 
 // IsTooManyRequests reports whether err is a 429 from the API.
 func IsTooManyRequests(err error) bool {
-	if e, ok := err.(*APIError); ok {
-		return e.StatusCode == http.StatusTooManyRequests
-	}
-	return false
+	var e *APIError
+	return errors.As(err, &e) && e.StatusCode == http.StatusTooManyRequests
 }
 
 // IsUnauthorized reports whether err is a 401 from the API.
 // A 401 means the API key is invalid or missing. This is a key-level failure
 // that requires operator action; the crawler must halt globally, not retry.
 func IsUnauthorized(err error) bool {
-	if e, ok := err.(*APIError); ok {
-		return e.StatusCode == http.StatusUnauthorized
-	}
-	return false
+	var e *APIError
+	return errors.As(err, &e) && e.StatusCode == http.StatusUnauthorized
 }
 
 // IsForbidden reports whether err is a 403 from the API.
 // A 403 means the API key is valid but the requesting IP is not whitelisted,
 // or the key was revoked. This is a key-level failure requiring operator action.
 func IsForbidden(err error) bool {
-	if e, ok := err.(*APIError); ok {
-		return e.StatusCode == http.StatusForbidden
-	}
-	return false
+	var e *APIError
+	return errors.As(err, &e) && e.StatusCode == http.StatusForbidden
 }
 
 // encodedTag converts a player tag (with or without '#') to the URL-encoded form
