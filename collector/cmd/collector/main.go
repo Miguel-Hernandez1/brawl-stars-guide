@@ -7,6 +7,8 @@
 //	collector repair showdown        - write participant rows for deferred Solo Showdown battles
 //	collector migrate up             - apply all pending database migrations
 //	collector migrate down           - roll back the last migration
+//	collector crawl-once <N>         - process exactly N crawl targets, then exit
+//	collector crawl                  - continuous crawl (requires explicit operator approval)
 package main
 
 import (
@@ -15,7 +17,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -23,19 +28,46 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/apiclient"
+	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/crawler"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/domain"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/ingestion"
+	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/ratelimit"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage/queries"
 )
 
 func main() {
-	if len(os.Args) < 3 {
+	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
 
-	cmd, sub := os.Args[1], os.Args[2]
+	cmd := os.Args[1]
+
+	// crawl-once and crawl are top-level commands (no sub-argument required for dispatch).
+	switch cmd {
+	case "crawl-once":
+		n := 5
+		if len(os.Args) >= 3 {
+			v, err := strconv.Atoi(os.Args[2])
+			if err != nil || v < 1 {
+				log.Fatalf("crawl-once: N must be a positive integer, got %q", os.Args[2])
+			}
+			n = v
+		}
+		runCrawlOnce(n)
+		return
+
+	case "crawl":
+		log.Fatal("continuous crawl is not yet enabled; run 'crawl-once N=5' and verify results first")
+	}
+
+	// All other commands require a subcommand.
+	if len(os.Args) < 3 {
+		usage()
+		os.Exit(1)
+	}
+	sub := os.Args[2]
 
 	switch cmd {
 	case "collect":
@@ -89,11 +121,15 @@ Commands:
   repair showdown        Write participant rows for deferred Solo Showdown battles
   migrate up             Apply pending database migrations
   migrate down           Roll back the last migration
+  crawl-once [N]         Process exactly N crawl targets (default 5), then exit
+  crawl                  Continuous crawl until SIGINT/SIGTERM (requires gate approval)
 
 Environment:
   BRAWLSTARS_API_TOKEN   Required for API calls
   DATABASE_URL           PostgreSQL DSN (default: postgres://playbook:playbook@localhost:5432/playbook?sslmode=disable)
-  MIGRATIONS_PATH        Path to SQL migration files (default: db/migrations)`)
+  MIGRATIONS_PATH        Path to SQL migration files (default: db/migrations)
+  CRAWLER_WORKERS        Worker goroutine count (default: 3)
+  CRAWLER_RATE_LIMIT     API requests per minute (default: 80)`)
 }
 
 // runCollectPlayer fetches and ingests one player's profile + battle log.
@@ -306,10 +342,45 @@ func runRepairShowdown() {
 	log.Printf("repaired %d battles, inserted %d participant rows", repaired, inserted)
 }
 
+// runCrawlOnce processes exactly n crawl targets across the configured worker pool, then exits.
+func runCrawlOnce(n int) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	client := mustAPIClient()
+	pool := mustDBPool(ctx)
+	defer pool.Close()
+
+	workers := mustEnvInt("CRAWLER_WORKERS", 3)
+	rateLimit := mustEnvInt("CRAWLER_RATE_LIMIT", 80)
+	limiter := ratelimit.New(rateLimit)
+	w := crawler.NewWorker(pool, client, limiter)
+
+	log.Printf("crawl-once: processing %d targets with %d workers at %d req/min", n, workers, rateLimit)
+	if err := crawler.RunN(ctx, w, workers, n); err != nil {
+		log.Fatalf("crawl-once: %v", err)
+	}
+	log.Printf("crawl-once: done")
+}
+
 // mustEnv returns the env var value or the provided default.
 func mustEnv(key, defaultVal string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return defaultVal
+}
+
+// mustEnvInt returns the env var parsed as an int, or defaultVal if unset or unparseable.
+func mustEnvInt(key string, defaultVal int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		log.Printf("warning: %s=%q is not a positive integer; using default %d", key, v, defaultVal)
+		return defaultVal
+	}
+	return n
 }

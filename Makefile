@@ -1,6 +1,6 @@
 ROOT := $(shell pwd)
 
-.PHONY: dev test test-verbose build collect migrate-up migrate-down seed-brawlers psql lint help
+.PHONY: dev test test-verbose build collect migrate-up migrate-down seed-brawlers psql lint crawl-once crawl help
 
 ## dev: start local PostgreSQL via docker compose
 dev:
@@ -42,6 +42,16 @@ seed-brawlers:
 collect:
 	@set -a; . ./.env 2>/dev/null; set +a; \
 	 go run ./collector/cmd/collector collect player "$${TAG:-$(tag)}"
+
+## crawl-once: process exactly N crawl targets, then exit (default N=5). E.g.: make crawl-once N=10
+crawl-once:
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./collector/cmd/collector crawl-once $${N:-5}
+
+## crawl: continuous crawl until SIGINT/SIGTERM (acceptance gate must be verified first)
+crawl:
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./collector/cmd/collector crawl
 
 ## psql: open a psql shell to the local dev database
 psql:
