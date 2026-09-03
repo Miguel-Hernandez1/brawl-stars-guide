@@ -124,7 +124,7 @@ func runCollectPlayer(rawTag string) {
 
 	// Ingest battles.
 	ingestor := ingestion.NewBattleIngestor(pool, tag)
-	newWith, newShowdown, skipped, errored, totalDiscoveries := 0, 0, 0, 0, 0
+	newBattles, skipped, errored, totalDiscoveries := 0, 0, 0, 0
 	for i, entry := range battleLog.Items {
 		result, err := ingestor.IngestBattle(ctx, entry)
 		if err != nil {
@@ -134,19 +134,15 @@ func runCollectPlayer(rawTag string) {
 			continue
 		}
 		if result.IsNew {
-			if result.HasParticipantRows {
-				newWith++
-			} else {
-				newShowdown++
-			}
+			newBattles++
 		} else {
 			skipped++
 		}
 		totalDiscoveries += len(result.NewDiscoveries)
 	}
 
-	log.Printf("battles: %d new with participants, %d new showdown (no participant rows), %d already existed, %d unrecognized, %d new players discovered",
-		newWith, newShowdown, skipped, errored, totalDiscoveries)
+	log.Printf("battles: %d new, %d already existed, %d unrecognized, %d new players discovered",
+		newBattles, skipped, errored, totalDiscoveries)
 }
 
 // runSeedBrawlers fetches all brawlers from the API and upserts them into the reference table.

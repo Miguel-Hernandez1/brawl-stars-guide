@@ -137,9 +137,9 @@ func InsertBattleParticipant(ctx context.Context, pool *pgxpool.Pool, p Particip
 }
 
 type ParticipantParams struct {
-	BattleID       int64
-	TeamID         int64
-	PlayerTag      string
+	BattleID        int64
+	TeamID          *int64 // nil for Solo Showdown (no team structure)
+	PlayerTag       string
 	PlayerName     string
 	BrawlerID      int
 	BrawlerPower   int

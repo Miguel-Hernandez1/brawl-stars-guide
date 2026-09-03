@@ -29,7 +29,7 @@ func NewBattleIngestor(pool *pgxpool.Pool, discovererTag string) *BattleIngestor
 type IngestResult struct {
 	Fingerprint        string
 	IsNew              bool
-	HasParticipantRows bool     // false for Showdown-style battles where participant rows are deferred
+	HasParticipantRows bool     // true for all fully-ingested battles (3v3 and Solo Showdown)
 	NewDiscoveries     []string // normalized player tags newly added to crawl queue
 }
 
@@ -147,7 +147,7 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 					bucket := domain.BucketForTrophies(p.Brawler.Trophies)
 					if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
 						BattleID:        bResult.BattleID,
-						TeamID:          teamID,
+						TeamID:          &teamID,
 						PlayerTag:       normalTag,
 						PlayerName:      p.Name,
 						BrawlerID:       p.Brawler.ID,
@@ -165,12 +165,27 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 		}
 
 	case len(entry.Battle.Players) > 0:
-		// Showdown-style mode. Raw battle data is stored for the record.
-		// Participant rows require a team_id and are deferred until the schema
-		// supports team-less participants. Players are still discovered.
-		hasParticipantRows = false
+		// Showdown-style mode (e.g. soloShowdown). No team structure in the API response,
+		// so team_id is NULL. Participant rows are written unconditionally (not gated on
+		// IsNew) so that re-collection repairs already-stored battles that had no participants.
+		// ON CONFLICT (battle_id, player_tag) DO NOTHING makes this idempotent.
+		hasParticipantRows = true
 		for _, p := range entry.Battle.Players {
 			normalTag := apiclient.NormalizeTag(p.Tag)
+			bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+			if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
+				BattleID:        bResult.BattleID,
+				TeamID:          nil,
+				PlayerTag:       normalTag,
+				PlayerName:      p.Name,
+				BrawlerID:       p.Brawler.ID,
+				BrawlerPower:    p.Brawler.Power,
+				BrawlerTrophies: p.Brawler.Trophies,
+				IsStarPlayer:    false,
+				TrophyBucket:    int16(bucket),
+			}); err != nil {
+				return IngestResult{}, fmt.Errorf("insert showdown participant %s: %w", normalTag, err)
+			}
 			newDiscoveries = b.discoverPlayer(ctx, normalTag, p.Name, newDiscoveries)
 		}
 
