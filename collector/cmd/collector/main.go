@@ -331,6 +331,10 @@ func runRepairShowdown() {
 				IsStarPlayer: false,
 			}
 			if p.Brawler.ID != 0 {
+				if err := queries.EnsureRetiredBrawler(ctx, pool, p.Brawler.ID, p.Brawler.Name); err != nil {
+					log.Printf("warning: battle %d participant %s: ensure brawler %d: %v", b.battleID, normalTag, p.Brawler.ID, err)
+					continue
+				}
 				bucket := domain.BucketForTrophies(p.Brawler.Trophies)
 				b16 := int16(bucket)
 				pp.BrawlerID = &p.Brawler.ID

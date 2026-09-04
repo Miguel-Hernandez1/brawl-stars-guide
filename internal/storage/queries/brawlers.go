@@ -47,3 +47,28 @@ func BrawlerExists(ctx context.Context, pool *pgxpool.Pool, id int) (bool, error
 	}
 	return exists, nil
 }
+
+// EnsureRetiredBrawler guarantees a brawler row exists before a participant
+// insert that would otherwise violate the brawler_id FK. Call this for any
+// nonzero brawler_id that originated from a historical battle log.
+//
+// If the brawler is already in the table (active or retired), this is a
+// no-op that preserves its existing is_active value. If it is absent, a
+// placeholder row is inserted with is_active=false and name taken from the
+// API response (or "BRAWLER_<id>" when the API returned an empty name for
+// a retired brawler).
+func EnsureRetiredBrawler(ctx context.Context, pool *pgxpool.Pool, id int, name string) error {
+	n := name
+	if n == "" {
+		n = fmt.Sprintf("BRAWLER_%d", id)
+	}
+	_, err := pool.Exec(ctx, `
+		INSERT INTO brawlers (id, name, is_active)
+		VALUES ($1, $2, false)
+		ON CONFLICT (id) DO NOTHING
+	`, id, n)
+	if err != nil {
+		return fmt.Errorf("ensure retired brawler %d: %w", id, err)
+	}
+	return nil
+}

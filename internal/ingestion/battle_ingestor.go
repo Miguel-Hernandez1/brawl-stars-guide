@@ -156,6 +156,11 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 					isStarPlayer := starPlayerTag != nil && *starPlayerTag == normalTag
 					bucket := domain.BucketForTrophies(p.Brawler.Trophies)
 					b16 := int16(bucket)
+					if p.Brawler.ID != 0 {
+						if err := queries.EnsureRetiredBrawler(ctx, b.pool, p.Brawler.ID, p.Brawler.Name); err != nil {
+							return IngestResult{}, fmt.Errorf("ensure brawler %d for participant %s: %w", p.Brawler.ID, normalTag, err)
+						}
+					}
 					if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
 						BattleID:        bResult.BattleID,
 						TeamID:          &teamID,
@@ -195,6 +200,9 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 				IsStarPlayer: false,
 			}
 			if p.Brawler.ID != 0 {
+				if err := queries.EnsureRetiredBrawler(ctx, b.pool, p.Brawler.ID, p.Brawler.Name); err != nil {
+					return IngestResult{}, fmt.Errorf("ensure brawler %d for participant %s: %w", p.Brawler.ID, normalTag, err)
+				}
 				bucket := domain.BucketForTrophies(p.Brawler.Trophies)
 				b16 := int16(bucket)
 				pp.BrawlerID = intPtr(p.Brawler.ID)
