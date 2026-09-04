@@ -20,10 +20,26 @@ import (
 // (401 Unauthorized or 403 Forbidden). The caller must cancel all workers.
 var ErrGlobalHalt = errors.New("crawler: API key failure (401 or 403); halt all workers")
 
+// apiClient is the API surface required by Worker. *apiclient.Client satisfies this
+// interface, and tests may substitute a fake implementation.
+type apiClient interface {
+	GetPlayer(ctx context.Context, tag string) (*apiclient.PlayerResponse, error)
+	GetBattleLog(ctx context.Context, tag string) (*apiclient.BattleLogResponse, error)
+}
+
 // WorkResult summarizes the outcome of a single crawl cycle.
 type WorkResult struct {
 	Tag         string
-	Status      string // "success", "not_found", "rate_limited", "error", "empty", "ownership_lost"
+	// Status values:
+	//   "success"        - crawl completed and finalized
+	//   "not_found"      - player deactivated (authoritative 404)
+	//   "rate_limited"   - requeued with 5-minute delay
+	//   "error"          - transient failure; backoff applied
+	//   "empty"          - queue had no claimable rows
+	//   "ownership_lost" - lease expired before ingestion began
+	//   "shutdown"       - context was cancelled (global halt or signal);
+	//                      no per-player penalty applied, lease expires naturally
+	Status      string
 	BattlesNew  int
 	Discoveries int
 }
@@ -31,12 +47,13 @@ type WorkResult struct {
 // Worker holds the shared resources used across crawl goroutines.
 type Worker struct {
 	pool    *pgxpool.Pool
-	client  *apiclient.Client
+	client  apiClient
 	limiter *ratelimit.Limiter
 }
 
 // NewWorker creates a Worker with the given shared pool, API client, and rate limiter.
-func NewWorker(pool *pgxpool.Pool, client *apiclient.Client, limiter *ratelimit.Limiter) *Worker {
+// client must implement apiClient; *apiclient.Client satisfies this interface.
+func NewWorker(pool *pgxpool.Pool, client apiClient, limiter *ratelimit.Limiter) *Worker {
 	return &Worker{pool: pool, client: client, limiter: limiter}
 }
 
@@ -44,12 +61,18 @@ func NewWorker(pool *pgxpool.Pool, client *apiclient.Client, limiter *ratelimit.
 // verifies the lease, ingests all data, and finalizes the claim.
 //
 //   - Returns WorkResult{Status: "empty"} when no claimable rows exist in the queue.
+//   - Returns WorkResult{Status: "shutdown"} when the shared context was cancelled
+//     (by a peer's global halt or by SIGINT). No per-player penalty is applied and
+//     no FinalizeCrawl is called; the claimed lease expires naturally after 10 minutes.
 //   - Returns ErrGlobalHalt on 401 or 403; the caller must cancel the shared context.
 //   - All other per-player errors are handled internally via FinalizeCrawl.
 func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	// --- Claim ---
 	claim, err := queries.ClaimNextTarget(ctx, w.pool)
 	if err != nil {
+		if ctx.Err() != nil {
+			return WorkResult{Status: "shutdown"}, nil
+		}
 		return WorkResult{}, fmt.Errorf("claim: %w", err)
 	}
 	if claim == nil {
@@ -60,24 +83,37 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	// --- Fetch player profile ---
 	if err := w.limiter.Wait(ctx); err != nil {
 		// Context cancelled before the first API call. Lease expires naturally.
-		return WorkResult{Tag: tag, Status: "error"}, nil
+		return WorkResult{Tag: tag, Status: "shutdown"}, nil
 	}
 	profile, err := w.client.GetPlayer(ctx, tag)
 	if err != nil {
 		if apiclient.IsUnauthorized(err) || apiclient.IsForbidden(err) {
 			return WorkResult{}, ErrGlobalHalt
 		}
+		// ctx.Err() specifically checks the shared crawler context, not any per-request
+		// timeout. http.Client.Timeout creates an internal child context per request; when
+		// that fires, the parent ctx remains live and ctx.Err() == nil, so genuine request
+		// timeouts still reach finalizeAPIError as transient errors. Only a shared-context
+		// cancellation (SIGINT or peer 401/403) sets ctx.Err(). In that case, leave the
+		// lease to expire naturally; a cleanup context here risks writing incorrect backoff
+		// state if another worker has already re-claimed the row.
+		if ctx.Err() != nil {
+			return WorkResult{Tag: tag, Status: "shutdown"}, nil
+		}
 		return WorkResult{Tag: tag, Status: w.finalizeAPIError(ctx, claim, err)}, nil
 	}
 
 	// --- Fetch battle log ---
 	if err := w.limiter.Wait(ctx); err != nil {
-		return WorkResult{Tag: tag, Status: "error"}, nil
+		return WorkResult{Tag: tag, Status: "shutdown"}, nil
 	}
 	battleLog, err := w.client.GetBattleLog(ctx, tag)
 	if err != nil {
 		if apiclient.IsUnauthorized(err) || apiclient.IsForbidden(err) {
 			return WorkResult{}, ErrGlobalHalt
+		}
+		if ctx.Err() != nil {
+			return WorkResult{Tag: tag, Status: "shutdown"}, nil
 		}
 		return WorkResult{Tag: tag, Status: w.finalizeAPIError(ctx, claim, err)}, nil
 	}
@@ -86,6 +122,9 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	// Both API calls succeeded. Before writing any rows, confirm the lease is still valid.
 	owned, err := queries.OwnershipValid(ctx, w.pool, tag, claim.Generation)
 	if err != nil {
+		if ctx.Err() != nil {
+			return WorkResult{Tag: tag, Status: "shutdown"}, nil
+		}
 		return WorkResult{Tag: tag, Status: "error"}, fmt.Errorf("ownership check %s: %w", tag, err)
 	}
 	if !owned {
@@ -99,6 +138,9 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	var battlesNew, discoveries int
 
 	if _, err = ingestion.IngestPlayer(ctx, w.pool, profile); err != nil {
+		if ctx.Err() != nil {
+			return WorkResult{Tag: tag, Status: "shutdown"}, nil
+		}
 		return WorkResult{Tag: tag, Status: w.finalizeTransientError(ctx, claim, err)}, nil
 	}
 
@@ -106,6 +148,9 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	for _, entry := range battleLog.Items {
 		result, err := ingestor.IngestBattle(ctx, entry)
 		if err != nil {
+			if ctx.Err() != nil {
+				return WorkResult{Tag: tag, Status: "shutdown"}, nil
+			}
 			return WorkResult{Tag: tag, Status: w.finalizeTransientError(ctx, claim, err)}, nil
 		}
 		if result.IsNew {
@@ -115,6 +160,9 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	}
 
 	// --- Finalize success ---
+	// If ingestion completed but the context was cancelled between ingestion and here,
+	// attempt finalize anyway; FinalizeCrawl already handles a cancelled context gracefully
+	// (logs a warning, lease expires naturally). The ingestion rows are already committed.
 	ok, err := queries.FinalizeCrawl(ctx, w.pool, queries.FinalizeParams{
 		PlayerTag:           tag,
 		Generation:          claim.Generation,
@@ -141,7 +189,8 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 }
 
 // finalizeAPIError classifies an API error and calls FinalizeCrawl with the appropriate
-// outcome. Returns the status string.
+// outcome. Returns the status string. This must only be called when ctx.Err() is nil
+// (i.e., the error is genuinely per-player, not a shutdown side-effect).
 //
 //   - 404 Not Found: deactivates the player (is_active=false), failures unchanged
 //   - 429 Too Many Requests: requeues with 5-minute delay, failures unchanged
@@ -189,6 +238,7 @@ func (w *Worker) finalizeAPIError(ctx context.Context, claim *queries.ClaimResul
 
 // finalizeTransientError handles ingestion-layer errors, which are always transient.
 // Increments consecutive_failures and applies exponential backoff.
+// Must only be called when ctx.Err() is nil.
 func (w *Worker) finalizeTransientError(ctx context.Context, claim *queries.ClaimResult, ingestErr error) string {
 	failures := claim.ConsecutiveFailures + 1
 	nextAt := time.Now().Add(backoffDuration(baseInterval(claim.Priority), claim.ConsecutiveFailures))

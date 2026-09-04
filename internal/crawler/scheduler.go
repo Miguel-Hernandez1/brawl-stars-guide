@@ -77,15 +77,18 @@ func Run(ctx context.Context, w *Worker, workerCount int) error {
 					}
 					return
 				}
-				if result.Status == "empty" {
+				switch result.Status {
+				case "empty":
 					select {
 					case <-time.After(30 * time.Second):
 					case <-ctx.Done():
 						return
 					}
 					continue
-				}
-				switch result.Status {
+				case "shutdown":
+					// Context was cancelled (global halt or signal). Exit without recording
+					// stats so the counts reflect only genuine per-player outcomes.
+					return
 				case "success":
 					atomic.AddInt64(&statsCrawled, 1)
 					atomic.AddInt64(&statsDiscoveries, int64(result.Discoveries))
@@ -138,15 +141,21 @@ func RunN(ctx context.Context, w *Worker, workerCount int, total int) error {
 					}
 					return
 				}
-				if result.Status == "empty" {
+				switch result.Status {
+				case "empty":
 					select {
 					case <-time.After(30 * time.Second):
 					case <-ctx.Done():
 						return
 					}
 					continue
+				case "shutdown":
+					// Context was cancelled (global halt or signal). Exit without
+					// decrementing the counter: this target was not successfully
+					// processed, so it should not count toward the N-target total.
+					return
 				}
-				// A target was claimed and fully processed (any non-empty outcome).
+				// A target was claimed and fully processed (any non-empty, non-shutdown outcome).
 				if atomic.AddInt64(&remaining, -1) <= 0 {
 					cancel()
 					return
