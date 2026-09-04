@@ -31,10 +31,10 @@ func TestClassifyAndSampleTarget_UnderCap(t *testing.T) {
 	tag := "TESTSMP01"
 	insertTestTarget(t, pool, tag)
 
-	// BucketCap=5, only 1 player in bucket: under cap, no eviction.
+	// BucketCap=5, only 1 player in bucket 91 (sentinel; no production rows here): under cap.
 	alwaysAccept := func() float64 { return 0.0 }
 	sampledOut, err := queries.ClassifyAndSampleTarget(
-		ctx, pool, tag, domain.Bucket3, 4, 7500, 5, alwaysAccept,
+		ctx, pool, tag, domain.TrophyBucket(91), 4, 7500, 5, alwaysAccept,
 	)
 	if err != nil {
 		t.Fatalf("ClassifyAndSampleTarget: %v", err)
@@ -51,8 +51,8 @@ func TestClassifyAndSampleTarget_UnderCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read back: %v", err)
 	}
-	if gotBucket == nil || *gotBucket != 3 {
-		t.Errorf("player_trophy_bucket: got %v, want 3", gotBucket)
+	if gotBucket == nil || *gotBucket != 91 {
+		t.Errorf("player_trophy_bucket: got %v, want 91", gotBucket)
 	}
 	if gotTrophies == nil || *gotTrophies != 7500 {
 		t.Errorf("trophy_estimate: got %v, want 7500", gotTrophies)
@@ -63,11 +63,12 @@ func TestClassifyAndSampleTarget_CapPlusOne_Reject(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	// Insert 1 pre-classified player in bucket 3 (cap=1 means bucket is at cap).
+	// Insert 1 pre-classified player in bucket 92 (sentinel; no production rows here).
+	// cap=1 means bucket is at cap after this insert.
 	existing := "TESTSMP02"
 	insertTestTarget(t, pool, existing)
 	_, err := pool.Exec(ctx,
-		`UPDATE crawl_targets SET player_trophy_bucket = 3, priority = 4, trophy_estimate = 5000
+		`UPDATE crawl_targets SET player_trophy_bucket = 92, priority = 4, trophy_estimate = 5000
 		 WHERE player_tag = $1`, existing)
 	if err != nil {
 		t.Fatalf("pre-classify existing: %v", err)
@@ -81,7 +82,7 @@ func TestClassifyAndSampleTarget_CapPlusOne_Reject(t *testing.T) {
 	// Use 0.9 (> 0.5) → reject.
 	alwaysReject := func() float64 { return 0.9 }
 	sampledOut, err := queries.ClassifyAndSampleTarget(
-		ctx, pool, incoming, domain.Bucket3, 4, 5000, 1, alwaysReject,
+		ctx, pool, incoming, domain.TrophyBucket(92), 4, 5000, 1, alwaysReject,
 	)
 	if err != nil {
 		t.Fatalf("ClassifyAndSampleTarget: %v", err)
@@ -100,8 +101,8 @@ func TestClassifyAndSampleTarget_CapPlusOne_Reject(t *testing.T) {
 	// Verify player_trophy_bucket was set on the incoming player (classify always runs before decision).
 	var incomingBucket *int
 	pool.QueryRow(ctx, `SELECT player_trophy_bucket FROM crawl_targets WHERE player_tag = $1`, incoming).Scan(&incomingBucket)
-	if incomingBucket == nil || *incomingBucket != 3 {
-		t.Errorf("incoming player_trophy_bucket: got %v, want 3", incomingBucket)
+	if incomingBucket == nil || *incomingBucket != 92 {
+		t.Errorf("incoming player_trophy_bucket: got %v, want 92", incomingBucket)
 	}
 }
 
@@ -109,11 +110,12 @@ func TestClassifyAndSampleTarget_CapPlusOne_Accept_Evicts(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	// Insert 1 pre-classified active player (cap=1 → must evict them on accept).
+	// Insert 1 pre-classified active player in bucket 93 (sentinel; no production rows).
+	// cap=1 → must evict them on accept.
 	existing := "TESTSMP04"
 	insertTestTarget(t, pool, existing)
 	_, err := pool.Exec(ctx,
-		`UPDATE crawl_targets SET player_trophy_bucket = 3, priority = 4, trophy_estimate = 5000
+		`UPDATE crawl_targets SET player_trophy_bucket = 93, priority = 4, trophy_estimate = 5000
 		 WHERE player_tag = $1`, existing)
 	if err != nil {
 		t.Fatalf("pre-classify existing: %v", err)
@@ -122,10 +124,10 @@ func TestClassifyAndSampleTarget_CapPlusOne_Accept_Evicts(t *testing.T) {
 	incoming := "TESTSMP05"
 	insertTestTarget(t, pool, incoming)
 
-	// Accept: rand < cap/seen_b = 1/2. Use 0.1.
+	// seen_b=2 after classifying incoming. Accept: 0.1 < cap/seen_b = 1/2 = 0.5.
 	alwaysAccept := func() float64 { return 0.1 }
 	sampledOut, err := queries.ClassifyAndSampleTarget(
-		ctx, pool, incoming, domain.Bucket3, 4, 5000, 1, alwaysAccept,
+		ctx, pool, incoming, domain.TrophyBucket(93), 4, 5000, 1, alwaysAccept,
 	)
 	if err != nil {
 		t.Fatalf("ClassifyAndSampleTarget: %v", err)
@@ -159,14 +161,14 @@ func TestClassifyAndSampleTarget_NeverEvictsCurrentPlayer(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	// cap=1, only the incoming player in the bucket (no others to evict).
-	// Even with alwaysAccept RNG, the active-others count is 0 < cap, so no eviction fires.
+	// cap=1, only the incoming player in bucket 94 (sentinel; no production rows).
+	// active-others count is 0 < cap, so no eviction fires even with alwaysAccept RNG.
 	incoming := "TESTSMP06"
 	insertTestTarget(t, pool, incoming)
 
 	alwaysAccept := func() float64 { return 0.0 }
 	sampledOut, err := queries.ClassifyAndSampleTarget(
-		ctx, pool, incoming, domain.Bucket4, 3, 15000, 1, alwaysAccept,
+		ctx, pool, incoming, domain.TrophyBucket(94), 3, 15000, 1, alwaysAccept,
 	)
 	if err != nil {
 		t.Fatalf("ClassifyAndSampleTarget: %v", err)
@@ -190,7 +192,7 @@ func TestUpdateCrawlProfile_ReclassifiedPlayer(t *testing.T) {
 	tag := "TESTSMP07"
 	insertTestTarget(t, pool, tag)
 	_, err := pool.Exec(ctx,
-		`UPDATE crawl_targets SET player_trophy_bucket = 3, priority = 5, trophy_estimate = 6000
+		`UPDATE crawl_targets SET player_trophy_bucket = 95, priority = 5, trophy_estimate = 6000
 		 WHERE player_tag = $1`, tag)
 	if err != nil {
 		t.Fatalf("pre-classify: %v", err)
@@ -212,8 +214,8 @@ func TestUpdateCrawlProfile_ReclassifiedPlayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read back: %v", err)
 	}
-	if bucket == nil || *bucket != 3 {
-		t.Errorf("player_trophy_bucket: got %v, want 3 (must not change on re-crawl)", bucket)
+	if bucket == nil || *bucket != 95 {
+		t.Errorf("player_trophy_bucket: got %v, want 95 (must not change on re-crawl)", bucket)
 	}
 	if trophies == nil || *trophies != newTrophies {
 		t.Errorf("trophy_estimate: got %v, want %d", trophies, newTrophies)
@@ -276,10 +278,11 @@ func TestEnqueueDiscoveredPlayer_TrophyEstimateSetAfterClassification(t *testing
 	}
 
 	// Simulate first successful GetPlayer by calling ClassifyAndSampleTarget.
+	// Use sentinel bucket 96 (no production rows) so the COUNT is 1 <= cap=750.
 	profileTrophies := 12345
 	alwaysAccept := func() float64 { return 0.0 }
 	_, err = queries.ClassifyAndSampleTarget(
-		ctx, pool, tag, domain.Bucket3, 4, profileTrophies, 750, alwaysAccept,
+		ctx, pool, tag, domain.TrophyBucket(96), 4, profileTrophies, 750, alwaysAccept,
 	)
 	if err != nil {
 		t.Fatalf("ClassifyAndSampleTarget: %v", err)
@@ -295,8 +298,8 @@ func TestEnqueueDiscoveredPlayer_TrophyEstimateSetAfterClassification(t *testing
 	if trophyEst == nil || *trophyEst != profileTrophies {
 		t.Errorf("trophy_estimate: got %v, want %d (must equal profile.Trophies)", trophyEst, profileTrophies)
 	}
-	if bucket == nil || *bucket != int(domain.Bucket3) {
-		t.Errorf("player_trophy_bucket: got %v, want %d", bucket, domain.Bucket3)
+	if bucket == nil || *bucket != 96 {
+		t.Errorf("player_trophy_bucket: got %v, want 96", bucket)
 	}
 }
 
@@ -443,8 +446,9 @@ func TestConcurrentBucketSampling_ActiveCountBelowCap(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Fixed RNG = 0.5: deterministic serial outcome given advisory lock serialisation.
-			so, _ := queries.ClassifyAndSampleTarget(ctx, pool, tag, domain.Bucket5, 2, 30000, bucketCap,
+			// Fixed RNG = 0.5; sentinel bucket 97 (no production rows) ensures COUNT
+			// includes only the 6 test players, making the serial math deterministic.
+			so, _ := queries.ClassifyAndSampleTarget(ctx, pool, tag, domain.TrophyBucket(97), 2, 30000, bucketCap,
 				func() float64 { return 0.5 },
 			)
 			resultCh <- classifyResult{tag: tag, sampledOut: so}
@@ -466,7 +470,7 @@ func TestConcurrentBucketSampling_ActiveCountBelowCap(t *testing.T) {
 	var activeCount int
 	err := pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM crawl_targets
-		 WHERE player_trophy_bucket = 5 AND is_active = TRUE AND player_tag LIKE 'TESTCON%'`,
+		 WHERE player_trophy_bucket = 97 AND is_active = TRUE`,
 	).Scan(&activeCount)
 	if err != nil {
 		t.Fatalf("count active: %v", err)

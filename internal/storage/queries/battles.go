@@ -117,6 +117,8 @@ func InsertBattleTeam(ctx context.Context, pool *pgxpool.Pool, battleID int64, t
 // InsertBattleParticipant inserts one participant record.
 // ON CONFLICT DO NOTHING because the same battle from a different player's log
 // has identical participant data.
+// BrawlerID, BrawlerPower, BrawlerTrophies, and TrophyBucket are nil when the API
+// does not provide brawler data (e.g. Duels / tagTeam mode returns brawler.id=0).
 func InsertBattleParticipant(ctx context.Context, pool *pgxpool.Pool, p ParticipantParams) error {
 	_, err := pool.Exec(ctx, `
 		INSERT INTO battle_participants (
@@ -138,14 +140,14 @@ func InsertBattleParticipant(ctx context.Context, pool *pgxpool.Pool, p Particip
 
 type ParticipantParams struct {
 	BattleID        int64
-	TeamID          *int64 // nil for Solo Showdown (no team structure)
+	TeamID          *int64  // nil for Showdown, Duels (no team structure)
 	PlayerTag       string
-	PlayerName     string
-	BrawlerID      int
-	BrawlerPower   int
-	BrawlerTrophies int
-	IsStarPlayer   bool
-	TrophyBucket   int16
+	PlayerName      string
+	BrawlerID       *int    // nil when API does not provide brawler data (e.g. Duels)
+	BrawlerPower    *int    // nil when API does not provide brawler data
+	BrawlerTrophies *int    // nil when API does not provide brawler data
+	IsStarPlayer    bool
+	TrophyBucket    *int16  // nil when brawler trophies are unavailable
 }
 
 // CountBattles returns the total number of battles in the database.

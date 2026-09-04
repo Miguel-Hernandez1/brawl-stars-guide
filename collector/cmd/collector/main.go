@@ -322,18 +322,22 @@ func runRepairShowdown() {
 		}
 		for _, p := range entry.Battle.Players {
 			normalTag := apiclient.NormalizeTag(p.Tag)
-			bucket := domain.BucketForTrophies(p.Brawler.Trophies)
-			if err := queries.InsertBattleParticipant(ctx, pool, queries.ParticipantParams{
-				BattleID:        b.battleID,
-				TeamID:          nil,
-				PlayerTag:       normalTag,
-				PlayerName:      p.Name,
-				BrawlerID:       p.Brawler.ID,
-				BrawlerPower:    p.Brawler.Power,
-				BrawlerTrophies: p.Brawler.Trophies,
-				IsStarPlayer:    false,
-				TrophyBucket:    int16(bucket),
-			}); err != nil {
+			pp := queries.ParticipantParams{
+				BattleID:     b.battleID,
+				TeamID:       nil,
+				PlayerTag:    normalTag,
+				PlayerName:   p.Name,
+				IsStarPlayer: false,
+			}
+			if p.Brawler.ID != 0 {
+				bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+				b16 := int16(bucket)
+				pp.BrawlerID = &p.Brawler.ID
+				pp.BrawlerPower = &p.Brawler.Power
+				pp.BrawlerTrophies = &p.Brawler.Trophies
+				pp.TrophyBucket = &b16
+			}
+			if err := queries.InsertBattleParticipant(ctx, pool, pp); err != nil {
 				log.Printf("warning: battle %d participant %s: %v", b.battleID, normalTag, err)
 				continue
 			}

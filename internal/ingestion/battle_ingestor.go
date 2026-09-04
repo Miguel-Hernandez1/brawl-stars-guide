@@ -155,16 +155,17 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 				if bResult.IsNew {
 					isStarPlayer := starPlayerTag != nil && *starPlayerTag == normalTag
 					bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+					b16 := int16(bucket)
 					if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
 						BattleID:        bResult.BattleID,
 						TeamID:          &teamID,
 						PlayerTag:       normalTag,
 						PlayerName:      p.Name,
-						BrawlerID:       p.Brawler.ID,
-						BrawlerPower:    p.Brawler.Power,
-						BrawlerTrophies: p.Brawler.Trophies,
+						BrawlerID:       intPtr(p.Brawler.ID),
+						BrawlerPower:    intPtr(p.Brawler.Power),
+						BrawlerTrophies: intPtr(p.Brawler.Trophies),
 						IsStarPlayer:    isStarPlayer,
-						TrophyBucket:    int16(bucket),
+						TrophyBucket:    &b16,
 					}); err != nil {
 						return IngestResult{}, fmt.Errorf("insert participant %s: %w", normalTag, err)
 					}
@@ -175,26 +176,35 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 		}
 
 	case len(entry.Battle.Players) > 0:
-		// Showdown-style mode (e.g. soloShowdown). No team structure in the API response,
-		// so team_id is NULL. Participant rows are written unconditionally (not gated on
-		// IsNew) so that re-collection repairs already-stored battles that had no participants.
-		// ON CONFLICT (battle_id, player_tag) DO NOTHING makes this idempotent.
+		// Flat-player modes (soloShowdown, Duels/tagTeam). No team structure in the API
+		// response, so team_id is NULL. Participant rows are written unconditionally (not
+		// gated on IsNew) so that re-collection repairs already-stored battles that lacked
+		// participants. ON CONFLICT (battle_id, player_tag) DO NOTHING makes this idempotent.
+		//
+		// For Duels (event.mode="tagTeam"), the API returns brawler.id=0 as a sentinel
+		// meaning "multiple brawlers used, none attributable." In that case brawler columns
+		// are stored as NULL rather than the placeholder zero value.
 		hasParticipantRows = true
 		for _, p := range entry.Battle.Players {
 			normalTag := apiclient.NormalizeTag(p.Tag)
-			bucket := domain.BucketForTrophies(p.Brawler.Trophies)
-			if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
-				BattleID:        bResult.BattleID,
-				TeamID:          nil,
-				PlayerTag:       normalTag,
-				PlayerName:      p.Name,
-				BrawlerID:       p.Brawler.ID,
-				BrawlerPower:    p.Brawler.Power,
-				BrawlerTrophies: p.Brawler.Trophies,
-				IsStarPlayer:    false,
-				TrophyBucket:    int16(bucket),
-			}); err != nil {
-				return IngestResult{}, fmt.Errorf("insert showdown participant %s: %w", normalTag, err)
+			pp := queries.ParticipantParams{
+				BattleID:   bResult.BattleID,
+				TeamID:     nil,
+				PlayerTag:  normalTag,
+				PlayerName: p.Name,
+				IsStarPlayer: false,
+			}
+			if p.Brawler.ID != 0 {
+				bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+				b16 := int16(bucket)
+				pp.BrawlerID = intPtr(p.Brawler.ID)
+				pp.BrawlerPower = intPtr(p.Brawler.Power)
+				pp.BrawlerTrophies = intPtr(p.Brawler.Trophies)
+				pp.TrophyBucket = &b16
+			}
+			// brawler fields remain nil (NULL in DB) when brawler.id == 0
+			if err := queries.InsertBattleParticipant(ctx, b.pool, pp); err != nil {
+				return IngestResult{}, fmt.Errorf("insert participant %s: %w", normalTag, err)
 			}
 			newDiscoveries = b.discoverPlayer(ctx, normalTag, p.Name, newDiscoveries)
 		}
@@ -305,3 +315,5 @@ func nullableInt(n int) *int {
 	}
 	return &n
 }
+
+func intPtr(n int) *int { return &n }
