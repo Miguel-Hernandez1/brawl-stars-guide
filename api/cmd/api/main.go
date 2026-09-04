@@ -66,6 +66,10 @@ func parseBattleType(w http.ResponseWriter, q map[string][]string) (analytics.Ba
 
 // -- winrates --
 
+// winRateResponse is the JSON envelope for GET /v1/meta/winrates.
+// data_label values per field:
+//   DIRECT:  sample_battles, total_slots, brawler.battles, brawler.slots, brawler.wins, brawler.losses, brawler.draws
+//   DERIVED: brawler.win_pct (wins/(wins+losses)), brawler.pick_rate (slots/total_slots)
 type winRateResponse struct {
 	Mode                string               `json:"mode"`
 	Map                 *string              `json:"map,omitempty"`
@@ -74,6 +78,7 @@ type winRateResponse struct {
 	MinBattles          int                  `json:"min_battles"`
 	DataLabel           string               `json:"data_label"`
 	SampleBattles       int                  `json:"sample_battles"`
+	TotalSlots          int                  `json:"total_slots"`
 	Brawlers            []brawlerWinRateJSON `json:"brawlers"`
 }
 
@@ -81,10 +86,12 @@ type brawlerWinRateJSON struct {
 	BrawlerID int      `json:"brawler_id"`
 	Name      string   `json:"name"`
 	Battles   int      `json:"battles"`
+	Slots     int      `json:"slots"`
 	Wins      int      `json:"wins"`
 	Losses    int      `json:"losses"`
 	Draws     int      `json:"draws"`
 	WinPct    *float64 `json:"win_pct"`
+	PickRate  *float64 `json:"pick_rate"`
 }
 
 func winRatesHandler(pool *pgxpool.Pool) http.HandlerFunc {
@@ -149,8 +156,9 @@ func winRatesHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			BattleType:          string(params.BattleType),
 			BrawlerTrophyBucket: params.BrawlerTrophyBucket,
 			MinBattles:          params.MinBattles,
-			DataLabel:           "DIRECT",
+			DataLabel:           "DIRECT+DERIVED",
 			SampleBattles:       result.SampleBattles,
+			TotalSlots:          result.TotalSlots,
 			Brawlers:            make([]brawlerWinRateJSON, len(result.Brawlers)),
 		}
 		for i, b := range result.Brawlers {
@@ -158,10 +166,12 @@ func winRatesHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				BrawlerID: b.BrawlerID,
 				Name:      b.Name,
 				Battles:   b.Battles,
+				Slots:     b.Slots,
 				Wins:      b.Wins,
 				Losses:    b.Losses,
 				Draws:     b.Draws,
 				WinPct:    b.WinPct,
+				PickRate:  b.PickRate,
 			}
 		}
 
