@@ -60,7 +60,16 @@ func TestShutdownRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer pool.Close()
+	// Register pool.Close via t.Cleanup (not defer) so it runs AFTER the data
+	// cleanup registered below. t.Cleanup is LIFO: last registered, first called.
+	// pool.Close registered first here => runs last, after the DELETE cleanup.
+	t.Cleanup(pool.Close)
+
+	// Data cleanup: registered second => runs first (LIFO), while pool is still open.
+	t.Cleanup(func() {
+		pool.Exec(context.Background(), `DELETE FROM crawl_targets WHERE player_tag IN ('TESTSD01','TESTSD02')`)
+		pool.Exec(context.Background(), `DELETE FROM players WHERE tag IN ('TESTSD01','TESTSD02')`)
+	})
 
 	// Insert two players then their crawl targets. Priority 1 with a far-past
 	// next_crawl_at ensures these rows sort to the front of the queue ahead of
@@ -87,10 +96,6 @@ func TestShutdownRace(t *testing.T) {
 			t.Fatalf("insert crawl_target %s: %v", tag, err)
 		}
 	}
-	t.Cleanup(func() {
-		pool.Exec(context.Background(), `DELETE FROM crawl_targets WHERE player_tag IN ('TESTSD01','TESTSD02')`)
-		pool.Exec(context.Background(), `DELETE FROM players WHERE tag IN ('TESTSD01','TESTSD02')`)
-	})
 
 	limiter := ratelimit.New(10000) // no throttle in tests
 	w := NewWorker(pool, &haltFakeClient{}, limiter)
