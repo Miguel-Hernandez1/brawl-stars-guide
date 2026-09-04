@@ -122,29 +122,29 @@ type BrawlerSnapshotParams struct {
 }
 
 // EnqueueDiscoveredPlayer adds a newly discovered player tag to the crawl queue.
-// No-ops if the player is already in the queue.
-// trophyEstimate and trophyBucket should be nil for battle-discovered players:
-// we only know brawler trophies at that point, not the player's total. The
-// profile fetch will fill these in when the player is crawled.
-func EnqueueDiscoveredPlayer(ctx context.Context, pool *pgxpool.Pool, tag, name, discoverySource, discoveryVia string, trophyEstimate *int, trophyBucket *int16) error {
+// Returns true when a new crawl_targets row was actually inserted (RowsAffected == 1).
+// Returns false when the player was already in crawl_targets (ON CONFLICT no-op), including
+// players that are inactive (not_found or sampled_out) -- those stay inactive.
+// trophy_estimate and player_trophy_bucket are never set at discovery time: total trophies
+// are unknown until GetPlayer is called. ClassifyAndSampleTarget sets them on first crawl.
+func EnqueueDiscoveredPlayer(ctx context.Context, pool *pgxpool.Pool, tag, name, discoverySource, discoveryVia string) (bool, error) {
 	_, err := pool.Exec(ctx, `
 		INSERT INTO players (tag, name, first_seen_at)
 		VALUES ($1, $2, NOW())
 		ON CONFLICT (tag) DO NOTHING
 	`, tag, name)
 	if err != nil {
-		return fmt.Errorf("upsert discovered player %s: %w", tag, err)
+		return false, fmt.Errorf("upsert discovered player %s: %w", tag, err)
 	}
 
-	_, err = pool.Exec(ctx, `
+	result, err := pool.Exec(ctx, `
 		INSERT INTO crawl_targets (
-			player_tag, priority, discovery_source, discovery_via_player,
-			trophy_estimate, trophy_bucket_at_discovery, next_crawl_at
-		) VALUES ($1, 5, $2, $3, $4, $5, NOW())
+			player_tag, priority, discovery_source, discovery_via_player, next_crawl_at
+		) VALUES ($1, 5, $2, $3, NOW())
 		ON CONFLICT (player_tag) DO NOTHING
-	`, tag, discoverySource, discoveryVia, trophyEstimate, trophyBucket)
+	`, tag, discoverySource, discoveryVia)
 	if err != nil {
-		return fmt.Errorf("enqueue discovered player %s: %w", tag, err)
+		return false, fmt.Errorf("enqueue discovered player %s: %w", tag, err)
 	}
-	return nil
+	return result.RowsAffected() == 1, nil
 }

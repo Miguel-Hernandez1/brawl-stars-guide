@@ -144,7 +144,7 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 		return WorkResult{Tag: tag, Status: w.finalizeTransientError(ctx, claim, err)}, nil
 	}
 
-	ingestor := ingestion.NewBattleIngestor(w.pool, apiclient.NormalizeTag(tag))
+	ingestor := ingestion.NewBattleIngestor(w.pool, apiclient.NormalizeTag(tag), ingestion.BattleIngestorConfig{})
 	for _, entry := range battleLog.Items {
 		result, err := ingestor.IngestBattle(ctx, entry)
 		if err != nil {

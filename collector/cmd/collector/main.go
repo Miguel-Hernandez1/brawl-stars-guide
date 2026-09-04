@@ -171,7 +171,7 @@ func runCollectPlayer(rawTag string) {
 	log.Printf("battle log: %d entries", len(battleLog.Items))
 
 	// Ingest battles.
-	ingestor := ingestion.NewBattleIngestor(pool, tag)
+	ingestor := ingestion.NewBattleIngestor(pool, tag, ingestion.BattleIngestorConfig{})
 	newBattles, skipped, errored, totalDiscoveries := 0, 0, 0, 0
 	for i, entry := range battleLog.Items {
 		result, err := ingestor.IngestBattle(ctx, entry)

@@ -1,0 +1,3 @@
+DROP INDEX IF EXISTS idx_crawl_targets_player_trophy_bucket;
+ALTER TABLE crawl_targets RENAME COLUMN player_trophy_bucket TO trophy_bucket_at_discovery;
+CREATE INDEX idx_crawl_targets_trophy_bucket ON crawl_targets(trophy_bucket_at_discovery);

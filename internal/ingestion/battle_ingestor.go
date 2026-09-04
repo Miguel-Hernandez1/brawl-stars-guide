@@ -13,16 +13,26 @@ import (
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage/queries"
 )
 
+// BattleIngestorConfig controls discovery behaviour for one RunOnce call.
+type BattleIngestorConfig struct {
+	// MaxDiscoveriesPerCrawl is the maximum number of new crawl_targets rows that may be
+	// inserted during one IngestBattle loop. 0 means unlimited (e.g. for manual collect).
+	MaxDiscoveriesPerCrawl int
+}
+
 // BattleIngestor writes battle log entries to the database with deduplication.
 type BattleIngestor struct {
-	pool          *pgxpool.Pool
-	discovererTag string // normalized tag of the player whose log we're processing
+	pool                 *pgxpool.Pool
+	discovererTag        string // normalized tag of the player whose log we're processing
+	cfg                  BattleIngestorConfig
+	discoveriesThisCrawl int // counts actual new crawl_targets inserts for this instance
 }
 
 // NewBattleIngestor creates an ingestor. discovererTag is the player whose battle
 // log is being ingested (needed to attribute trophy_change correctly).
-func NewBattleIngestor(pool *pgxpool.Pool, discovererTag string) *BattleIngestor {
-	return &BattleIngestor{pool: pool, discovererTag: discovererTag}
+// cfg controls per-crawl discovery budget; pass BattleIngestorConfig{} for no limit.
+func NewBattleIngestor(pool *pgxpool.Pool, discovererTag string, cfg BattleIngestorConfig) *BattleIngestor {
+	return &BattleIngestor{pool: pool, discovererTag: discovererTag, cfg: cfg}
 }
 
 // IngestResult summarises the outcome of ingesting one battle.
@@ -206,42 +216,27 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 	}, nil
 }
 
-// discoverPlayer enqueues a newly encountered player tag for crawling if not already
-// present. It is a no-op for the discoverer's own tag. Returns the updated discoveries slice.
+// discoverPlayer enqueues a newly encountered player tag for crawling.
+// It is a no-op for the discoverer's own tag, for tags already in crawl_targets
+// (including sampled_out rows), and when the per-crawl budget is exhausted.
+// Only increments the budget counter when a new crawl_targets row is actually inserted.
 func (b *BattleIngestor) discoverPlayer(ctx context.Context, normalTag, name string, discoveries []string) []string {
 	if normalTag == b.discovererTag {
 		return discoveries
 	}
-	ok, err := b.shouldEnqueue(ctx, normalTag)
+	if b.cfg.MaxDiscoveriesPerCrawl > 0 && b.discoveriesThisCrawl >= b.cfg.MaxDiscoveriesPerCrawl {
+		return discoveries
+	}
+	inserted, err := queries.EnqueueDiscoveredPlayer(ctx, b.pool, normalTag, name, "battle_discovery", b.discovererTag)
 	if err != nil {
-		log.Printf("warning: check enqueue %s: %v", normalTag, err)
-		return discoveries
-	}
-	if !ok {
-		return discoveries
-	}
-	if err := queries.EnqueueDiscoveredPlayer(ctx, b.pool,
-		normalTag, name,
-		"battle_discovery", b.discovererTag,
-		nil, nil,
-	); err != nil {
 		log.Printf("warning: enqueue %s: %v", normalTag, err)
 		return discoveries
 	}
-	return append(discoveries, normalTag)
-}
-
-// shouldEnqueue checks whether a discovered player tag should be added to the crawl queue.
-// Currently: add if not already present. Future: bucket capacity checks.
-func (b *BattleIngestor) shouldEnqueue(ctx context.Context, tag string) (bool, error) {
-	var exists bool
-	err := b.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM crawl_targets WHERE player_tag = $1)`, tag,
-	).Scan(&exists)
-	if err != nil {
-		return false, err
+	if !inserted {
+		return discoveries
 	}
-	return !exists, nil
+	b.discoveriesThisCrawl++
+	return append(discoveries, normalTag)
 }
 
 // collectParticipantTags returns all raw player tags from a battle entry.
