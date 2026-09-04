@@ -73,15 +73,21 @@ func battleTypeSQL(bt BattleTypeFilter) string {
 	}
 }
 
-// BrawlerWinRate holds per-brawler win-rate data for a single mode query.
+// BrawlerWinRate holds per-brawler stats for a single mode query.
+//
+// Field labels:
+//   - DIRECT: raw COUNT or SUM from the database with no further computation.
+//   - DERIVED: a ratio computed from DIRECT fields.
 type BrawlerWinRate struct {
 	BrawlerID int
 	Name      string
-	Battles   int      // COUNT(DISTINCT battle_id) where this brawler appeared
-	Wins      int      // participant rows on a 'victory' team
-	Losses    int      // participant rows on a 'defeat' team
-	Draws     int      // participant rows on a 'draw' team
-	WinPct    *float64 // wins/(wins+losses), rounded to 3 decimal places; nil when wins+losses==0
+	Battles   int      // DIRECT: COUNT(DISTINCT battle_id) where this brawler appeared
+	Slots     int      // DIRECT: COUNT(*) of eligible participant rows (wins+losses+draws); numerator for PickRate
+	Wins      int      // DIRECT: participant rows on a 'victory' team
+	Losses    int      // DIRECT: participant rows on a 'defeat' team
+	Draws     int      // DIRECT: participant rows on a 'draw' team
+	WinPct    *float64 // DERIVED: wins/(wins+losses), rounded to 3 decimal places; nil when wins+losses==0
+	PickRate  *float64 // DERIVED: slots/total_slots, rounded to 4 decimal places; nil when total_slots==0
 }
 
 // WinRateParams configures a BrawlerWinRates query.
@@ -95,17 +101,22 @@ type WinRateParams struct {
 
 // WinRateResult is the output of BrawlerWinRates.
 type WinRateResult struct {
-	SampleBattles int              // distinct eligible battles in the filtered population
+	SampleBattles int              // DIRECT: COUNT(DISTINCT b.id) of eligible battles in the filtered population
+	TotalSlots    int              // DIRECT: COUNT(*) of eligible participant rows in the filtered population; denominator for PickRate
 	Brawlers      []BrawlerWinRate // ordered by win_pct DESC NULLS LAST, then battles DESC
 }
 
-// BrawlerWinRates returns per-brawler win rates for a 3v3 mode.
+// BrawlerWinRates returns per-brawler win rates and pick rates for a mode.
 //
 // Eligible rows: bt.result IN ('victory','defeat','draw'), non-null brawler_id,
 // and battle_type matching p.BattleType (default: 'ranked' only).
 //
-// Draws are reported separately and excluded from the win_pct denominator:
-// win_pct = wins / (wins + losses).
+// Draws are reported separately and excluded from the WinPct denominator:
+// WinPct = wins / (wins + losses).
+//
+// PickRate = slots / TotalSlots where TotalSlots is COUNT(*) of all eligible
+// participant rows in the population. Slots can exceed Battles when the same
+// brawler appears on both teams in a single battle.
 //
 // Returns an error for rank-based or attribution-free modes (soloShowdown, duoShowdown,
 // trioShowdown, tagTeam).
@@ -153,12 +164,15 @@ func BrawlerWinRates(ctx context.Context, pool *pgxpool.Pool, p WinRateParams) (
         JOIN battle_teams bt ON bt.id = bp.team_id
         JOIN battles b       ON b.id  = bp.battle_id`
 
-	// Count distinct eligible battles in the filtered population.
-	var sampleBattles int
+	// Count eligible battles (DIRECT) and total eligible participant slots (DIRECT)
+	// in one scan. TotalSlots is the authoritative denominator for PickRate; the
+	// relationship total_slots = sample_battles * players_per_battle is an integrity
+	// check, not the definition.
+	var sampleBattles, totalSlots int
 	if err := pool.QueryRow(ctx,
-		`SELECT COUNT(DISTINCT b.id)`+baseJoins+baseWhere,
+		`SELECT COUNT(DISTINCT b.id), COUNT(*)`+baseJoins+baseWhere,
 		baseArgs...,
-	).Scan(&sampleBattles); err != nil {
+	).Scan(&sampleBattles, &totalSlots); err != nil {
 		return WinRateResult{}, fmt.Errorf("count eligible battles: %w", err)
 	}
 
@@ -199,9 +213,16 @@ func BrawlerWinRates(ctx context.Context, pool *pgxpool.Pool, p WinRateParams) (
 		if err := rows.Scan(&r.BrawlerID, &r.Name, &r.Battles, &r.Wins, &r.Losses, &r.Draws); err != nil {
 			return WinRateResult{}, fmt.Errorf("scan brawler row: %w", err)
 		}
+		// Slots = wins + losses + draws by identity (all result types sum to COUNT(*)).
+		// This is algebraically equivalent to COUNT(*) for this brawler in the same WHERE clause.
+		r.Slots = r.Wins + r.Losses + r.Draws
 		if r.Wins+r.Losses > 0 {
 			pct := math.Round(float64(r.Wins)/float64(r.Wins+r.Losses)*1000) / 1000
 			r.WinPct = &pct
+		}
+		if totalSlots > 0 {
+			rate := math.Round(float64(r.Slots)/float64(totalSlots)*10000) / 10000
+			r.PickRate = &rate
 		}
 		brawlers = append(brawlers, r)
 	}
@@ -209,5 +230,5 @@ func BrawlerWinRates(ctx context.Context, pool *pgxpool.Pool, p WinRateParams) (
 		return WinRateResult{}, fmt.Errorf("iterate brawler rows: %w", err)
 	}
 
-	return WinRateResult{SampleBattles: sampleBattles, Brawlers: brawlers}, nil
+	return WinRateResult{SampleBattles: sampleBattles, TotalSlots: totalSlots, Brawlers: brawlers}, nil
 }
