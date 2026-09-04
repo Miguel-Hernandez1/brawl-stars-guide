@@ -1,0 +1,277 @@
+package analytics
+
+import (
+	"context"
+	"math"
+	"os"
+	"testing"
+
+	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage"
+)
+
+// TestIsIneligibleMode verifies the denylist of rank-based and attribution-free modes.
+func TestIsIneligibleMode(t *testing.T) {
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{"soloShowdown", true},
+		{"duoShowdown", true},
+		{"trioShowdown", true},
+		{"tagTeam", true},
+		{"gemGrab", false},
+		{"knockout", false},
+		{"brawlBall", false},
+		{"heist", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsIneligibleMode(tc.mode); got != tc.want {
+			t.Errorf("IsIneligibleMode(%q) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}
+
+// TestBrawlerWinRates_IneligibleMode verifies that calling BrawlerWinRates with a
+// showdown mode returns an error immediately without touching the DB.
+func TestBrawlerWinRates_IneligibleMode(t *testing.T) {
+	_, err := BrawlerWinRates(context.Background(), nil, WinRateParams{Mode: "soloShowdown"})
+	if err == nil {
+		t.Fatal("expected error for soloShowdown mode, got nil")
+	}
+}
+
+// TestBrawlerWinRates_Integration inserts controlled test data into the DB and verifies
+// that BrawlerWinRates returns correct counts, win_pct, and sample_battles.
+//
+// Test data: one 3v3 battle in mode "testWinRate99" with two synthetic brawlers.
+//   - Team A (victory): TESTWRP1-TESTA, TESTWRP2-TESTB, TESTWRP3-TESTA
+//   - Team B (defeat):  TESTWRP4-TESTB, TESTWRP5-TESTA, TESTWRP6-TESTB
+//
+// Expected after querying with min_battles=1:
+//
+//	TESTA: battles=1, wins=2 (WRP1+WRP3), losses=1 (WRP5), win_pct=0.667
+//	TESTB: battles=1, wins=1 (WRP2), losses=2 (WRP4+WRP6), win_pct=0.333
+func TestBrawlerWinRates_Integration(t *testing.T) {
+	dsn := os.Getenv("INTEGRATION_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("INTEGRATION_TEST_DATABASE_URL not set; skipping win-rate integration test")
+	}
+
+	ctx := context.Background()
+	pool, err := storage.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	const (
+		testMode     = "testWinRate99"
+		testEventSID = 99999810 // synthetic supercell event ID, guaranteed unused
+		testBrawlerA = 99999811 // synthetic brawler A
+		testBrawlerB = 99999812 // synthetic brawler B
+		testFP       = "TESTWRFP001"
+	)
+	players := []string{"TESTWRP1", "TESTWRP2", "TESTWRP3", "TESTWRP4", "TESTWRP5", "TESTWRP6"}
+
+	// Pre-clean any leftover state from a previous failed run.
+	pool.Exec(ctx, `DELETE FROM battle_participants WHERE player_tag = ANY($1)`, players)
+	pool.Exec(ctx, `DELETE FROM battle_teams WHERE battle_id IN (SELECT id FROM battles WHERE event_mode = $1)`, testMode)
+	pool.Exec(ctx, `DELETE FROM battles WHERE event_mode = $1`, testMode)
+	pool.Exec(ctx, `DELETE FROM events WHERE supercell_id = $1`, testEventSID)
+	pool.Exec(ctx, `DELETE FROM brawlers WHERE id IN ($1, $2)`, testBrawlerA, testBrawlerB)
+	pool.Exec(ctx, `DELETE FROM players WHERE tag = ANY($1)`, players)
+
+	t.Cleanup(func() {
+		bg := context.Background()
+		pool.Exec(bg, `DELETE FROM battle_participants WHERE player_tag = ANY($1)`, players)
+		pool.Exec(bg, `DELETE FROM battle_teams WHERE battle_id IN (SELECT id FROM battles WHERE event_mode = $1)`, testMode)
+		pool.Exec(bg, `DELETE FROM battles WHERE event_mode = $1`, testMode)
+		pool.Exec(bg, `DELETE FROM events WHERE supercell_id = $1`, testEventSID)
+		pool.Exec(bg, `DELETE FROM brawlers WHERE id IN ($1, $2)`, testBrawlerA, testBrawlerB)
+		pool.Exec(bg, `DELETE FROM players WHERE tag = ANY($1)`, players)
+	})
+
+	// Insert players.
+	for _, tag := range players {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO players (tag, name) VALUES ($1, 'Test') ON CONFLICT (tag) DO NOTHING`, tag,
+		); err != nil {
+			t.Fatalf("insert player %s: %v", tag, err)
+		}
+	}
+
+	// Insert synthetic brawlers.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO brawlers (id, name, is_active) VALUES ($1, 'TESTA', true), ($2, 'TESTB', true)`,
+		testBrawlerA, testBrawlerB,
+	); err != nil {
+		t.Fatalf("insert brawlers: %v", err)
+	}
+
+	// Insert event.
+	var eventID int
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO events (supercell_id, mode, map_name) VALUES ($1, $2, 'Test Map') RETURNING id`,
+		testEventSID, testMode,
+	).Scan(&eventID); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	// Insert battle.
+	var battleID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO battles
+		   (fingerprint, battle_time, event_id, event_mode, event_map, battle_type, raw_battle_data)
+		 VALUES ($1, NOW(), $2, $3, 'Test Map', 'ranked', '{}')
+		 RETURNING id`,
+		testFP, eventID, testMode,
+	).Scan(&battleID); err != nil {
+		t.Fatalf("insert battle: %v", err)
+	}
+
+	// Insert teams: team 0 = victory, team 1 = defeat.
+	var teamAID, teamBID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO battle_teams (battle_id, team_index, result) VALUES ($1, 0, 'victory') RETURNING id`,
+		battleID,
+	).Scan(&teamAID); err != nil {
+		t.Fatalf("insert team A: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO battle_teams (battle_id, team_index, result) VALUES ($1, 1, 'defeat') RETURNING id`,
+		battleID,
+	).Scan(&teamBID); err != nil {
+		t.Fatalf("insert team B: %v", err)
+	}
+
+	// trophy_bucket 2 = 500-2000 trophies.
+	insertP := func(teamID int64, tag string, brawlerID int) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO battle_participants
+			   (battle_id, team_id, player_tag, player_name,
+			    brawler_id, brawler_power, brawler_trophies, is_star_player, trophy_bucket)
+			 VALUES ($1, $2, $3, 'Test', $4, 10, 500, false, 2)`,
+			battleID, teamID, tag, brawlerID,
+		); err != nil {
+			t.Fatalf("insert participant %s: %v", tag, err)
+		}
+	}
+
+	// Team A (victory): WRP1=TESTA, WRP2=TESTB, WRP3=TESTA
+	insertP(teamAID, "TESTWRP1", testBrawlerA)
+	insertP(teamAID, "TESTWRP2", testBrawlerB)
+	insertP(teamAID, "TESTWRP3", testBrawlerA)
+	// Team B (defeat): WRP4=TESTB, WRP5=TESTA, WRP6=TESTB
+	insertP(teamBID, "TESTWRP4", testBrawlerB)
+	insertP(teamBID, "TESTWRP5", testBrawlerA)
+	insertP(teamBID, "TESTWRP6", testBrawlerB)
+
+	// Run the query with min_battles=1 to include both brawlers.
+	result, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates: %v", err)
+	}
+
+	if result.SampleBattles != 1 {
+		t.Errorf("SampleBattles = %d, want 1", result.SampleBattles)
+	}
+	if len(result.Brawlers) != 2 {
+		t.Fatalf("len(Brawlers) = %d, want 2", len(result.Brawlers))
+	}
+
+	// TESTA should be first (higher win_pct).
+	a, b := result.Brawlers[0], result.Brawlers[1]
+	if a.BrawlerID != testBrawlerA {
+		t.Errorf("Brawlers[0] = %d (%s), want TESTA (%d)", a.BrawlerID, a.Name, testBrawlerA)
+	}
+	if b.BrawlerID != testBrawlerB {
+		t.Errorf("Brawlers[1] = %d (%s), want TESTB (%d)", b.BrawlerID, b.Name, testBrawlerB)
+	}
+
+	// TESTA: 1 distinct battle, 2 wins (WRP1+WRP3), 1 loss (WRP5).
+	if a.Battles != 1 {
+		t.Errorf("TESTA.Battles = %d, want 1", a.Battles)
+	}
+	if a.Wins != 2 {
+		t.Errorf("TESTA.Wins = %d, want 2", a.Wins)
+	}
+	if a.Losses != 1 {
+		t.Errorf("TESTA.Losses = %d, want 1", a.Losses)
+	}
+	if a.Draws != 0 {
+		t.Errorf("TESTA.Draws = %d, want 0", a.Draws)
+	}
+	if a.WinPct == nil {
+		t.Fatal("TESTA.WinPct is nil")
+	}
+	wantA := math.Round(float64(2)/float64(3)*1000) / 1000
+	if *a.WinPct != wantA {
+		t.Errorf("TESTA.WinPct = %.4f, want %.4f", *a.WinPct, wantA)
+	}
+
+	// TESTB: 1 distinct battle, 1 win (WRP2), 2 losses (WRP4+WRP6).
+	if b.Battles != 1 {
+		t.Errorf("TESTB.Battles = %d, want 1", b.Battles)
+	}
+	if b.Wins != 1 {
+		t.Errorf("TESTB.Wins = %d, want 1", b.Wins)
+	}
+	if b.Losses != 2 {
+		t.Errorf("TESTB.Losses = %d, want 2", b.Losses)
+	}
+	if b.WinPct == nil {
+		t.Fatal("TESTB.WinPct is nil")
+	}
+	wantB := math.Round(float64(1)/float64(3)*1000) / 1000
+	if *b.WinPct != wantB {
+		t.Errorf("TESTB.WinPct = %.4f, want %.4f", *b.WinPct, wantB)
+	}
+
+	// Verify that min_battles=2 excludes both brawlers (each only appears in 1 distinct battle).
+	result2, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		MinBattles: 2,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates min_battles=2: %v", err)
+	}
+	if len(result2.Brawlers) != 0 {
+		t.Errorf("min_battles=2: expected 0 brawlers, got %d", len(result2.Brawlers))
+	}
+	// sample_battles is still 1 (the eligible population does not change with min_battles).
+	if result2.SampleBattles != 1 {
+		t.Errorf("min_battles=2: SampleBattles = %d, want 1", result2.SampleBattles)
+	}
+
+	// Verify bucket filter: bucket=2 should return same result; bucket=3 should return empty.
+	b2 := int16(2)
+	resultBucket, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:                testMode,
+		BrawlerTrophyBucket: &b2,
+		MinBattles:          1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates bucket=2: %v", err)
+	}
+	if len(resultBucket.Brawlers) != 2 {
+		t.Errorf("bucket=2: expected 2 brawlers, got %d", len(resultBucket.Brawlers))
+	}
+
+	b3 := int16(3)
+	resultBucket3, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:                testMode,
+		BrawlerTrophyBucket: &b3,
+		MinBattles:          1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates bucket=3: %v", err)
+	}
+	if len(resultBucket3.Brawlers) != 0 {
+		t.Errorf("bucket=3: expected 0 brawlers, got %d", len(resultBucket3.Brawlers))
+	}
+}
