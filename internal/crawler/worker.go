@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/apiclient"
+	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/domain"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/ingestion"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/ratelimit"
 	"github.com/Miguel-Hernandez1/brawl-stars-playbook/internal/storage/queries"
@@ -27,11 +29,26 @@ type apiClient interface {
 	GetBattleLog(ctx context.Context, tag string) (*apiclient.BattleLogResponse, error)
 }
 
+// WorkerConfig holds population-control settings for a Worker.
+type WorkerConfig struct {
+	// MaxDiscoveriesPerCrawl is the maximum number of new crawl_targets rows that may be
+	// inserted during one RunOnce call. 0 means unlimited.
+	MaxDiscoveriesPerCrawl int
+	// MaxActiveTargets is the global soft ceiling on is_active=TRUE rows. When the live
+	// count reaches this value, discovery is disabled for the current RunOnce call.
+	// 0 means unlimited.
+	MaxActiveTargets int
+	// BucketCap is the maximum number of active players per trophy bucket after
+	// classification. 0 disables reservoir sampling entirely.
+	BucketCap int
+}
+
 // WorkResult summarizes the outcome of a single crawl cycle.
 type WorkResult struct {
-	Tag         string
+	Tag string
 	// Status values:
 	//   "success"        - crawl completed and finalized
+	//   "sampled_out"    - crawl succeeded but player deactivated by reservoir sampling
 	//   "not_found"      - player deactivated (authoritative 404)
 	//   "rate_limited"   - requeued with 5-minute delay
 	//   "error"          - transient failure; backoff applied
@@ -49,12 +66,13 @@ type Worker struct {
 	pool    *pgxpool.Pool
 	client  apiClient
 	limiter *ratelimit.Limiter
+	cfg     WorkerConfig
 }
 
-// NewWorker creates a Worker with the given shared pool, API client, and rate limiter.
+// NewWorker creates a Worker with the given shared pool, API client, rate limiter, and config.
 // client must implement apiClient; *apiclient.Client satisfies this interface.
-func NewWorker(pool *pgxpool.Pool, client apiClient, limiter *ratelimit.Limiter) *Worker {
-	return &Worker{pool: pool, client: client, limiter: limiter}
+func NewWorker(pool *pgxpool.Pool, client apiClient, limiter *ratelimit.Limiter, cfg WorkerConfig) *Worker {
+	return &Worker{pool: pool, client: client, limiter: limiter, cfg: cfg}
 }
 
 // RunOnce claims one crawl target, fetches both the player profile and battle log,
@@ -82,7 +100,6 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 
 	// --- Fetch player profile ---
 	if err := w.limiter.Wait(ctx); err != nil {
-		// Context cancelled before the first API call. Lease expires naturally.
 		return WorkResult{Tag: tag, Status: "shutdown"}, nil
 	}
 	profile, err := w.client.GetPlayer(ctx, tag)
@@ -119,7 +136,6 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 	}
 
 	// --- Pre-ingestion ownership check ---
-	// Both API calls succeeded. Before writing any rows, confirm the lease is still valid.
 	owned, err := queries.OwnershipValid(ctx, w.pool, tag, claim.Generation)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -133,10 +149,8 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 		return WorkResult{Tag: tag, Status: "ownership_lost"}, nil
 	}
 
-	// --- Ingest ---
+	// --- Ingest player profile ---
 	start := time.Now()
-	var battlesNew, discoveries int
-
 	if _, err = ingestion.IngestPlayer(ctx, w.pool, profile); err != nil {
 		if ctx.Err() != nil {
 			return WorkResult{Tag: tag, Status: "shutdown"}, nil
@@ -144,7 +158,55 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 		return WorkResult{Tag: tag, Status: w.finalizeTransientError(ctx, claim, err)}, nil
 	}
 
-	ingestor := ingestion.NewBattleIngestor(w.pool, apiclient.NormalizeTag(tag), ingestion.BattleIngestorConfig{})
+	// --- Classify and sample (first crawl) or update profile (re-crawl) ---
+	// realPriority is derived from the fresh profile; used for both bucket sampling
+	// and the success rescheduling interval (fixes stale claim.Priority bug).
+	realPriority := domain.PriorityForTrophies(profile.Trophies)
+	realBucket := domain.BucketForTrophies(profile.Trophies)
+
+	var sampledOut bool
+	if !claim.IsClassified {
+		sampledOut, err = queries.ClassifyAndSampleTarget(
+			ctx, w.pool, tag, realBucket, realPriority, profile.Trophies, w.cfg.BucketCap, rand.Float64,
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return WorkResult{Tag: tag, Status: "shutdown"}, nil
+			}
+			// Classification failed (DB error). IngestPlayer already committed; keep player
+			// active with old priority rather than incorrectly recording a transient failure.
+			slog.Warn("bucket classification failed; player kept active with stale priority",
+				"tag", tag, "err", err)
+			realPriority = claim.Priority
+		}
+	} else {
+		if err = queries.UpdateCrawlProfile(ctx, w.pool, tag, realPriority, profile.Trophies); err != nil {
+			if ctx.Err() != nil {
+				return WorkResult{Tag: tag, Status: "shutdown"}, nil
+			}
+			slog.Warn("update crawl profile failed; continuing with stale priority",
+				"tag", tag, "err", err)
+			realPriority = claim.Priority
+		}
+	}
+
+	// --- Check global active target ceiling before discovery ---
+	ingestorCfg := ingestion.BattleIngestorConfig{
+		MaxDiscoveriesPerCrawl: w.cfg.MaxDiscoveriesPerCrawl,
+	}
+	if w.cfg.MaxActiveTargets > 0 {
+		activeCount, countErr := queries.ActiveTargetCount(ctx, w.pool)
+		if countErr == nil && int(activeCount) >= w.cfg.MaxActiveTargets {
+			ingestorCfg.MaxDiscoveriesPerCrawl = 0
+			slog.Info("discovery disabled: active target ceiling reached",
+				"active_count", activeCount, "ceiling", w.cfg.MaxActiveTargets)
+		}
+	}
+
+	// --- Ingest battle log ---
+	var battlesNew, discoveries int
+
+	ingestor := ingestion.NewBattleIngestor(w.pool, apiclient.NormalizeTag(tag), ingestorCfg)
 	for _, entry := range battleLog.Items {
 		result, err := ingestor.IngestBattle(ctx, entry)
 		if err != nil {
@@ -159,21 +221,27 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 		discoveries += len(result.NewDiscoveries)
 	}
 
-	// --- Finalize success ---
-	// If ingestion completed but the context was cancelled between ingestion and here,
-	// attempt finalize anyway; FinalizeCrawl already handles a cancelled context gracefully
-	// (logs a warning, lease expires naturally). The ingestion rows are already committed.
+	// --- Finalize ---
+	// sampledOut=true means ingestion succeeded but reservoir sampling rejected this player.
+	// Data is preserved; the player is deactivated for population control.
+	finalStatus := "success"
+	isActive := true
+	if sampledOut {
+		finalStatus = "sampled_out"
+		isActive = false
+	}
+
 	ok, err := queries.FinalizeCrawl(ctx, w.pool, queries.FinalizeParams{
 		PlayerTag:           tag,
 		Generation:          claim.Generation,
-		Status:              "success",
-		NextCrawlAt:         time.Now().Add(baseInterval(claim.Priority)),
+		Status:              finalStatus,
+		NextCrawlAt:         time.Now().Add(baseInterval(realPriority)),
 		ConsecutiveFailures: 0,
-		IsActive:            true,
+		IsActive:            isActive,
 	})
 	if err != nil {
-		slog.Warn("finalize success failed; ingestion already committed",
-			"tag", tag, "err", err)
+		slog.Warn("finalize failed; ingestion already committed",
+			"tag", tag, "status", finalStatus, "err", err)
 	} else if !ok {
 		slog.Warn("finalize generation mismatch; ingestion already committed",
 			"tag", tag, "generation", claim.Generation)
@@ -181,11 +249,12 @@ func (w *Worker) RunOnce(ctx context.Context) (WorkResult, error) {
 
 	slog.Info("player crawled",
 		"tag", tag,
+		"status", finalStatus,
 		"battles_new", battlesNew,
 		"discoveries", discoveries,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
-	return WorkResult{Tag: tag, Status: "success", BattlesNew: battlesNew, Discoveries: discoveries}, nil
+	return WorkResult{Tag: tag, Status: finalStatus, BattlesNew: battlesNew, Discoveries: discoveries}, nil
 }
 
 // finalizeAPIError classifies an API error and calls FinalizeCrawl with the appropriate
@@ -204,15 +273,15 @@ func (w *Worker) finalizeAPIError(ctx context.Context, claim *queries.ClaimResul
 	switch {
 	case apiclient.IsNotFound(apiErr):
 		status = "not_found"
-		nextAt = time.Now().Add(24 * time.Hour) // row is inactive; value is irrelevant
-		failures = claim.ConsecutiveFailures    // unchanged: 404 is not a transient failure
+		nextAt = time.Now().Add(24 * time.Hour)
+		failures = claim.ConsecutiveFailures
 		isActive = false
 		slog.Info("player not_found", "tag", claim.PlayerTag)
 
 	case apiclient.IsTooManyRequests(apiErr):
 		status = "rate_limited"
 		nextAt = time.Now().Add(5 * time.Minute)
-		failures = claim.ConsecutiveFailures // unchanged: rate limiting is not a player failure
+		failures = claim.ConsecutiveFailures
 		isActive = true
 		slog.Info("player rate_limited",
 			"tag", claim.PlayerTag,
@@ -252,8 +321,7 @@ func (w *Worker) finalizeTransientError(ctx context.Context, claim *queries.Clai
 	return "error"
 }
 
-// finalize calls FinalizeCrawl and logs a warning if it fails. A finalize failure is
-// non-fatal: the lease expires naturally after 10 minutes, making the row re-claimable.
+// finalize calls FinalizeCrawl and logs a warning if it fails.
 func (w *Worker) finalize(ctx context.Context, claim *queries.ClaimResult, status string, nextAt time.Time, failures int32, isActive bool) {
 	_, err := queries.FinalizeCrawl(ctx, w.pool, queries.FinalizeParams{
 		PlayerTag:           claim.PlayerTag,
@@ -294,7 +362,7 @@ func baseInterval(priority int16) time.Duration {
 func backoffDuration(base time.Duration, n int32) time.Duration {
 	const maxBackoff = 7 * 24 * time.Hour
 	d := time.Duration(float64(base) * math.Pow(2, float64(n)))
-	if d > maxBackoff || d < 0 { // d < 0 guards int64 overflow for very large n
+	if d > maxBackoff || d < 0 {
 		return maxBackoff
 	}
 	return d

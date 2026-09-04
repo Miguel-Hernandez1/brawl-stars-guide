@@ -128,8 +128,11 @@ Environment:
   BRAWLSTARS_API_TOKEN   Required for API calls
   DATABASE_URL           PostgreSQL DSN (default: postgres://playbook:playbook@localhost:5432/playbook?sslmode=disable)
   MIGRATIONS_PATH        Path to SQL migration files (default: db/migrations)
-  CRAWLER_WORKERS        Worker goroutine count (default: 3)
-  CRAWLER_RATE_LIMIT     API requests per minute (default: 80)`)
+  CRAWLER_WORKERS                   Worker goroutine count (default: 3)
+  CRAWLER_RATE_LIMIT                API requests per minute (default: 80)
+  CRAWLER_MAX_DISCOVERIES_PER_CRAWL Max new queue inserts per crawl (default: 10, 0=unlimited)
+  CRAWLER_MAX_ACTIVE_TARGETS        Global active-target soft ceiling (default: 5000, 0=unlimited)
+  CRAWLER_BUCKET_CAP                Max active players per trophy bucket (default: 750, 0=unlimited)`)
 }
 
 // runCollectPlayer fetches and ingests one player's profile + battle log.
@@ -354,9 +357,16 @@ func runCrawlOnce(n int) {
 	workers := mustEnvInt("CRAWLER_WORKERS", 3)
 	rateLimit := mustEnvInt("CRAWLER_RATE_LIMIT", 80)
 	limiter := ratelimit.New(rateLimit)
-	w := crawler.NewWorker(pool, client, limiter)
+	cfg := crawler.WorkerConfig{
+		MaxDiscoveriesPerCrawl: mustEnvInt("CRAWLER_MAX_DISCOVERIES_PER_CRAWL", 10),
+		MaxActiveTargets:       mustEnvInt("CRAWLER_MAX_ACTIVE_TARGETS", 5000),
+		BucketCap:              mustEnvInt("CRAWLER_BUCKET_CAP", 750),
+	}
+	w := crawler.NewWorker(pool, client, limiter, cfg)
 
-	log.Printf("crawl-once: processing %d targets with %d workers at %d req/min", n, workers, rateLimit)
+	log.Printf("crawl-once: processing %d targets with %d workers at %d req/min"+
+		" (budget=%d ceiling=%d bucket_cap=%d)",
+		n, workers, rateLimit, cfg.MaxDiscoveriesPerCrawl, cfg.MaxActiveTargets, cfg.BucketCap)
 	if err := crawler.RunN(ctx, w, workers, n); err != nil {
 		log.Fatalf("crawl-once: %v", err)
 	}

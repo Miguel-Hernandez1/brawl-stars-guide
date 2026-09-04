@@ -98,7 +98,7 @@ func TestShutdownRace(t *testing.T) {
 	}
 
 	limiter := ratelimit.New(10000) // no throttle in tests
-	w := NewWorker(pool, &haltFakeClient{}, limiter)
+	w := NewWorker(pool, &haltFakeClient{}, limiter, WorkerConfig{})
 
 	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
