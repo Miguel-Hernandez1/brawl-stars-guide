@@ -180,6 +180,10 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 	if result.SampleBattles != 1 {
 		t.Errorf("SampleBattles = %d, want 1", result.SampleBattles)
 	}
+	// One 3v3 battle = 6 eligible participant rows. TotalSlots is COUNT(*), not sample_battles*6.
+	if result.TotalSlots != 6 {
+		t.Errorf("TotalSlots = %d, want 6", result.TotalSlots)
+	}
 	if len(result.Brawlers) != 2 {
 		t.Fatalf("len(Brawlers) = %d, want 2", len(result.Brawlers))
 	}
@@ -193,7 +197,7 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 		t.Errorf("Brawlers[1] = %d (%s), want TESTB (%d)", b.BrawlerID, b.Name, testBrawlerB)
 	}
 
-	// TESTA: 1 distinct battle, 2 wins (WRP1+WRP3), 1 loss (WRP5).
+	// TESTA: 1 distinct battle, 2 wins (WRP1+WRP3), 1 loss (WRP5), 3 slots total.
 	if a.Battles != 1 {
 		t.Errorf("TESTA.Battles = %d, want 1", a.Battles)
 	}
@@ -206,6 +210,10 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 	if a.Draws != 0 {
 		t.Errorf("TESTA.Draws = %d, want 0", a.Draws)
 	}
+	// Slots = wins + losses + draws (DIRECT count identity).
+	if a.Slots != 3 {
+		t.Errorf("TESTA.Slots = %d, want 3 (wins+losses+draws)", a.Slots)
+	}
 	if a.WinPct == nil {
 		t.Fatal("TESTA.WinPct is nil")
 	}
@@ -213,8 +221,16 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 	if *a.WinPct != wantA {
 		t.Errorf("TESTA.WinPct = %.4f, want %.4f", *a.WinPct, wantA)
 	}
+	// TESTA pick_rate = 3 slots / 6 total_slots = 0.5000.
+	if a.PickRate == nil {
+		t.Fatal("TESTA.PickRate is nil")
+	}
+	wantPickA := math.Round(float64(3)/float64(6)*10000) / 10000
+	if *a.PickRate != wantPickA {
+		t.Errorf("TESTA.PickRate = %.4f, want %.4f", *a.PickRate, wantPickA)
+	}
 
-	// TESTB: 1 distinct battle, 1 win (WRP2), 2 losses (WRP4+WRP6).
+	// TESTB: 1 distinct battle, 1 win (WRP2), 2 losses (WRP4+WRP6), 3 slots total.
 	if b.Battles != 1 {
 		t.Errorf("TESTB.Battles = %d, want 1", b.Battles)
 	}
@@ -224,12 +240,23 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 	if b.Losses != 2 {
 		t.Errorf("TESTB.Losses = %d, want 2", b.Losses)
 	}
+	if b.Slots != 3 {
+		t.Errorf("TESTB.Slots = %d, want 3", b.Slots)
+	}
 	if b.WinPct == nil {
 		t.Fatal("TESTB.WinPct is nil")
 	}
 	wantB := math.Round(float64(1)/float64(3)*1000) / 1000
 	if *b.WinPct != wantB {
 		t.Errorf("TESTB.WinPct = %.4f, want %.4f", *b.WinPct, wantB)
+	}
+	// TESTB pick_rate = 3/6 = 0.5000 (same as TESTA; both brawlers appear equally in the one battle).
+	if b.PickRate == nil {
+		t.Fatal("TESTB.PickRate is nil")
+	}
+	wantPickB := math.Round(float64(3)/float64(6)*10000) / 10000
+	if *b.PickRate != wantPickB {
+		t.Errorf("TESTB.PickRate = %.4f, want %.4f", *b.PickRate, wantPickB)
 	}
 
 	// Verify that min_battles=2 excludes both brawlers (each only appears in 1 distinct battle).
@@ -243,9 +270,12 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 	if len(result2.Brawlers) != 0 {
 		t.Errorf("min_battles=2: expected 0 brawlers, got %d", len(result2.Brawlers))
 	}
-	// sample_battles is still 1 (the eligible population does not change with min_battles).
+	// SampleBattles and TotalSlots reflect the eligible population, not the HAVING-filtered brawlers.
 	if result2.SampleBattles != 1 {
 		t.Errorf("min_battles=2: SampleBattles = %d, want 1", result2.SampleBattles)
+	}
+	if result2.TotalSlots != 6 {
+		t.Errorf("min_battles=2: TotalSlots = %d, want 6", result2.TotalSlots)
 	}
 
 	// Verify bucket filter: bucket=2 should return same result; bucket=3 should return empty.
@@ -437,7 +467,7 @@ func TestBrawlerWinRates_FriendlyExclusion(t *testing.T) {
 	insertP(teamBID, "TESTWRFR5", testBrawlerA)
 	insertP(teamBID, "TESTWRFR6", testBrawlerB)
 
-	// Default (ranked): friendly battle is excluded, so no results.
+	// Default (ranked): friendly battle is excluded -- SampleBattles=0, TotalSlots=0.
 	resultRanked, err := BrawlerWinRates(ctx, pool, WinRateParams{
 		Mode:       testMode,
 		MinBattles: 1,
@@ -448,11 +478,14 @@ func TestBrawlerWinRates_FriendlyExclusion(t *testing.T) {
 	if resultRanked.SampleBattles != 0 {
 		t.Errorf("ranked: SampleBattles = %d, want 0 (friendly battle excluded)", resultRanked.SampleBattles)
 	}
+	if resultRanked.TotalSlots != 0 {
+		t.Errorf("ranked: TotalSlots = %d, want 0 (friendly battle excluded)", resultRanked.TotalSlots)
+	}
 	if len(resultRanked.Brawlers) != 0 {
 		t.Errorf("ranked: expected 0 brawlers, got %d", len(resultRanked.Brawlers))
 	}
 
-	// BattleTypeAny: friendly battle is included.
+	// BattleTypeAny: friendly battle is included -- SampleBattles=1, TotalSlots=6.
 	resultAny, err := BrawlerWinRates(ctx, pool, WinRateParams{
 		Mode:       testMode,
 		BattleType: BattleTypeAny,
@@ -464,7 +497,21 @@ func TestBrawlerWinRates_FriendlyExclusion(t *testing.T) {
 	if resultAny.SampleBattles != 1 {
 		t.Errorf("any: SampleBattles = %d, want 1", resultAny.SampleBattles)
 	}
+	if resultAny.TotalSlots != 6 {
+		t.Errorf("any: TotalSlots = %d, want 6 (6 participant rows in the friendly battle)", resultAny.TotalSlots)
+	}
 	if len(resultAny.Brawlers) != 2 {
 		t.Errorf("any: expected 2 brawlers, got %d", len(resultAny.Brawlers))
+	}
+	// Each brawler has 3 slots out of 6 total => pick_rate = 0.5000.
+	for _, br := range resultAny.Brawlers {
+		if br.Slots != 3 {
+			t.Errorf("any: brawler %s Slots = %d, want 3", br.Name, br.Slots)
+		}
+		if br.PickRate == nil {
+			t.Errorf("any: brawler %s PickRate is nil", br.Name)
+		} else if *br.PickRate != 0.5 {
+			t.Errorf("any: brawler %s PickRate = %.4f, want 0.5000", br.Name, *br.PickRate)
+		}
 	}
 }
