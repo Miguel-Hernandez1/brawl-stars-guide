@@ -15,6 +15,10 @@ type ClaimResult struct {
 	Generation          int32
 	Priority            int16
 	ConsecutiveFailures int32
+	// IsClassified is true when player_trophy_bucket IS NOT NULL, meaning this player
+	// has already been through ClassifyAndSampleTarget on a prior crawl. Re-crawls of
+	// classified players use UpdateCrawlProfile instead of ClassifyAndSampleTarget.
+	IsClassified bool
 }
 
 // ClaimNextTarget claims one idle crawl target using a short transaction.
@@ -31,8 +35,10 @@ func ClaimNextTarget(ctx context.Context, pool *pgxpool.Pool) (*ClaimResult, err
 	var tag string
 	var gen, failures int32
 	var priority int16
+	var isClassified bool
 	err = tx.QueryRow(ctx, `
-		SELECT player_tag, crawl_generation, priority, consecutive_failures
+		SELECT player_tag, crawl_generation, priority, consecutive_failures,
+		       player_trophy_bucket IS NOT NULL AS is_classified
 		FROM crawl_targets
 		WHERE is_active = TRUE
 		  AND next_crawl_at <= NOW()
@@ -40,7 +46,7 @@ func ClaimNextTarget(ctx context.Context, pool *pgxpool.Pool) (*ClaimResult, err
 		ORDER BY priority ASC, next_crawl_at ASC
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`).Scan(&tag, &gen, &priority, &failures)
+	`).Scan(&tag, &gen, &priority, &failures, &isClassified)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -70,6 +76,7 @@ func ClaimNextTarget(ctx context.Context, pool *pgxpool.Pool) (*ClaimResult, err
 		Generation:          gen,
 		Priority:            priority,
 		ConsecutiveFailures: failures,
+		IsClassified:        isClassified,
 	}, nil
 }
 
