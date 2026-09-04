@@ -59,7 +59,8 @@ func main() {
 		return
 
 	case "crawl":
-		log.Fatal("continuous crawl is not yet enabled; run 'crawl-once N=5' and verify results first")
+		runCrawl()
+		return
 	}
 
 	// All other commands require a subcommand.
@@ -375,6 +376,34 @@ func runCrawlOnce(n int) {
 		log.Fatalf("crawl-once: %v", err)
 	}
 	log.Printf("crawl-once: done")
+}
+
+// runCrawl runs the crawler continuously until SIGINT/SIGTERM.
+func runCrawl() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	client := mustAPIClient()
+	pool := mustDBPool(ctx)
+	defer pool.Close()
+
+	workers := mustEnvInt("CRAWLER_WORKERS", 3)
+	rateLimit := mustEnvInt("CRAWLER_RATE_LIMIT", 80)
+	limiter := ratelimit.New(rateLimit)
+	cfg := crawler.WorkerConfig{
+		MaxDiscoveriesPerCrawl: mustEnvInt("CRAWLER_MAX_DISCOVERIES_PER_CRAWL", 10),
+		MaxActiveTargets:       mustEnvInt("CRAWLER_MAX_ACTIVE_TARGETS", 5000),
+		BucketCap:              mustEnvInt("CRAWLER_BUCKET_CAP", 750),
+	}
+	w := crawler.NewWorker(pool, client, limiter, cfg)
+
+	log.Printf("crawl: starting continuous crawl with %d workers at %d req/min"+
+		" (budget=%d ceiling=%d bucket_cap=%d)",
+		workers, rateLimit, cfg.MaxDiscoveriesPerCrawl, cfg.MaxActiveTargets, cfg.BucketCap)
+	if err := crawler.Run(ctx, w, workers); err != nil {
+		log.Fatalf("crawl: %v", err)
+	}
+	log.Printf("crawl: stopped")
 }
 
 // mustEnv returns the env var value or the provided default.
