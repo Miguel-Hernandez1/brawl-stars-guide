@@ -274,4 +274,197 @@ func TestBrawlerWinRates_Integration(t *testing.T) {
 	if len(resultBucket3.Brawlers) != 0 {
 		t.Errorf("bucket=3: expected 0 brawlers, got %d", len(resultBucket3.Brawlers))
 	}
+
+	// Verify map filter: matching map returns both brawlers; wrong map returns none.
+	matchMap := "Test Map"
+	resultMap, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		Map:        &matchMap,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates map=Test Map: %v", err)
+	}
+	if len(resultMap.Brawlers) != 2 {
+		t.Errorf("map=Test Map: expected 2 brawlers, got %d", len(resultMap.Brawlers))
+	}
+
+	wrongMap := "No Such Map"
+	resultWrongMap, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		Map:        &wrongMap,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates map=No Such Map: %v", err)
+	}
+	if len(resultWrongMap.Brawlers) != 0 {
+		t.Errorf("map=No Such Map: expected 0 brawlers, got %d", len(resultWrongMap.Brawlers))
+	}
+
+	// Verify battle_type filter: test data is 'ranked', so soloRanked returns empty.
+	resultSR, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		BattleType: BattleTypeSoloRanked,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates battle_type=soloRanked: %v", err)
+	}
+	if len(resultSR.Brawlers) != 0 {
+		t.Errorf("battle_type=soloRanked: expected 0 brawlers (data is ranked), got %d", len(resultSR.Brawlers))
+	}
+
+	// BattleTypeCompetitive includes ranked, so returns same 2 brawlers.
+	resultComp, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		BattleType: BattleTypeCompetitive,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates battle_type=competitive: %v", err)
+	}
+	if len(resultComp.Brawlers) != 2 {
+		t.Errorf("battle_type=competitive: expected 2 brawlers, got %d", len(resultComp.Brawlers))
+	}
+}
+
+// TestBrawlerWinRates_FriendlyExclusion verifies that battles with battle_type='friendly'
+// are excluded by the default (ranked) filter and included only with BattleTypeAny.
+func TestBrawlerWinRates_FriendlyExclusion(t *testing.T) {
+	dsn := os.Getenv("INTEGRATION_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("INTEGRATION_TEST_DATABASE_URL not set; skipping friendly exclusion test")
+	}
+
+	ctx := context.Background()
+	pool, err := storage.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	const (
+		testMode     = "testFriendly99"
+		testEventSID = 99999820
+		testBrawlerA = 99999821
+		testBrawlerB = 99999822
+		testFP       = "TESTWRFP002"
+	)
+	players := []string{"TESTWRFR1", "TESTWRFR2", "TESTWRFR3", "TESTWRFR4", "TESTWRFR5", "TESTWRFR6"}
+
+	pool.Exec(ctx, `DELETE FROM battle_participants WHERE player_tag = ANY($1)`, players)
+	pool.Exec(ctx, `DELETE FROM battle_teams WHERE battle_id IN (SELECT id FROM battles WHERE event_mode = $1)`, testMode)
+	pool.Exec(ctx, `DELETE FROM battles WHERE event_mode = $1`, testMode)
+	pool.Exec(ctx, `DELETE FROM events WHERE supercell_id = $1`, testEventSID)
+	pool.Exec(ctx, `DELETE FROM brawlers WHERE id IN ($1, $2)`, testBrawlerA, testBrawlerB)
+	pool.Exec(ctx, `DELETE FROM players WHERE tag = ANY($1)`, players)
+
+	t.Cleanup(func() {
+		bg := context.Background()
+		pool.Exec(bg, `DELETE FROM battle_participants WHERE player_tag = ANY($1)`, players)
+		pool.Exec(bg, `DELETE FROM battle_teams WHERE battle_id IN (SELECT id FROM battles WHERE event_mode = $1)`, testMode)
+		pool.Exec(bg, `DELETE FROM battles WHERE event_mode = $1`, testMode)
+		pool.Exec(bg, `DELETE FROM events WHERE supercell_id = $1`, testEventSID)
+		pool.Exec(bg, `DELETE FROM brawlers WHERE id IN ($1, $2)`, testBrawlerA, testBrawlerB)
+		pool.Exec(bg, `DELETE FROM players WHERE tag = ANY($1)`, players)
+	})
+
+	for _, tag := range players {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO players (tag, name) VALUES ($1, 'Test') ON CONFLICT (tag) DO NOTHING`, tag,
+		); err != nil {
+			t.Fatalf("insert player %s: %v", tag, err)
+		}
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO brawlers (id, name, is_active) VALUES ($1, 'TESTA', true), ($2, 'TESTB', true)`,
+		testBrawlerA, testBrawlerB,
+	); err != nil {
+		t.Fatalf("insert brawlers: %v", err)
+	}
+
+	var eventID int
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO events (supercell_id, mode, map_name) VALUES ($1, $2, 'Friendly Map') RETURNING id`,
+		testEventSID, testMode,
+	).Scan(&eventID); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	// Insert a battle with battle_type='friendly' (not 'ranked').
+	var battleID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO battles
+		   (fingerprint, battle_time, event_id, event_mode, event_map, battle_type, raw_battle_data)
+		 VALUES ($1, NOW(), $2, $3, 'Friendly Map', 'friendly', '{}')
+		 RETURNING id`,
+		testFP, eventID, testMode,
+	).Scan(&battleID); err != nil {
+		t.Fatalf("insert battle: %v", err)
+	}
+
+	var teamAID, teamBID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO battle_teams (battle_id, team_index, result) VALUES ($1, 0, 'victory') RETURNING id`,
+		battleID,
+	).Scan(&teamAID); err != nil {
+		t.Fatalf("insert team A: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO battle_teams (battle_id, team_index, result) VALUES ($1, 1, 'defeat') RETURNING id`,
+		battleID,
+	).Scan(&teamBID); err != nil {
+		t.Fatalf("insert team B: %v", err)
+	}
+
+	insertP := func(teamID int64, tag string, brawlerID int) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO battle_participants
+			   (battle_id, team_id, player_tag, player_name,
+			    brawler_id, brawler_power, brawler_trophies, is_star_player, trophy_bucket)
+			 VALUES ($1, $2, $3, 'Test', $4, 10, 500, false, 2)`,
+			battleID, teamID, tag, brawlerID,
+		); err != nil {
+			t.Fatalf("insert participant %s: %v", tag, err)
+		}
+	}
+	insertP(teamAID, "TESTWRFR1", testBrawlerA)
+	insertP(teamAID, "TESTWRFR2", testBrawlerB)
+	insertP(teamAID, "TESTWRFR3", testBrawlerA)
+	insertP(teamBID, "TESTWRFR4", testBrawlerB)
+	insertP(teamBID, "TESTWRFR5", testBrawlerA)
+	insertP(teamBID, "TESTWRFR6", testBrawlerB)
+
+	// Default (ranked): friendly battle is excluded, so no results.
+	resultRanked, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates ranked (default): %v", err)
+	}
+	if resultRanked.SampleBattles != 0 {
+		t.Errorf("ranked: SampleBattles = %d, want 0 (friendly battle excluded)", resultRanked.SampleBattles)
+	}
+	if len(resultRanked.Brawlers) != 0 {
+		t.Errorf("ranked: expected 0 brawlers, got %d", len(resultRanked.Brawlers))
+	}
+
+	// BattleTypeAny: friendly battle is included.
+	resultAny, err := BrawlerWinRates(ctx, pool, WinRateParams{
+		Mode:       testMode,
+		BattleType: BattleTypeAny,
+		MinBattles: 1,
+	})
+	if err != nil {
+		t.Fatalf("BrawlerWinRates battle_type=any: %v", err)
+	}
+	if resultAny.SampleBattles != 1 {
+		t.Errorf("any: SampleBattles = %d, want 1", resultAny.SampleBattles)
+	}
+	if len(resultAny.Brawlers) != 2 {
+		t.Errorf("any: expected 2 brawlers, got %d", len(resultAny.Brawlers))
+	}
 }
