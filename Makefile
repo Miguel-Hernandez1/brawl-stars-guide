@@ -1,6 +1,6 @@
 ROOT := $(shell pwd)
 
-.PHONY: dev test test-verbose build collect migrate-up migrate-down seed-brawlers psql lint crawl-once crawl help
+.PHONY: dev test test-verbose build collect migrate-up migrate-down seed-brawlers psql lint crawl-once crawl serve help
 
 ## dev: start local PostgreSQL via docker compose
 dev:
@@ -60,6 +60,11 @@ psql:
 ## lint: run go vet
 lint:
 	go vet ./...
+
+## serve: start the REST API server (reads DATABASE_URL from .env, listens on :8080)
+serve:
+	@set -a; . ./.env 2>/dev/null; set +a; \
+	 go run ./api/cmd/api
 
 ## help: list available targets
 help:
