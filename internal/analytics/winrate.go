@@ -23,6 +23,56 @@ func IsIneligibleMode(mode string) bool {
 	return ineligibleModes[mode]
 }
 
+// BattleTypeFilter controls which battle types are included in a win-rate query.
+// Friendly and challenge battles are excluded by default because they are non-competitive
+// and produce structurally incomplete participant sets (some have fewer than 3 players
+// per team due to forfeits). Using them in meta analysis biases win rates.
+type BattleTypeFilter string
+
+const (
+	// BattleTypeRanked includes only battle_type='ranked' (team Ranked queue).
+	// This is the default for all win-rate queries.
+	BattleTypeRanked BattleTypeFilter = "ranked"
+
+	// BattleTypeSoloRanked includes only battle_type='soloRanked' (solo queue Ranked).
+	// Produces different win-rate distributions than BattleTypeRanked because team
+	// coordination and pick patterns differ between the two queues.
+	BattleTypeSoloRanked BattleTypeFilter = "soloRanked"
+
+	// BattleTypeCompetitive includes both 'ranked' and 'soloRanked'. Use when you want
+	// the union of competitive play without distinguishing queue type.
+	BattleTypeCompetitive BattleTypeFilter = "competitive"
+
+	// BattleTypeAny applies no battle_type filter. Includes friendly and challenge battles.
+	// Intended for diagnostics only; friendly battles have incomplete participant sets.
+	BattleTypeAny BattleTypeFilter = "any"
+)
+
+// ValidBattleType reports whether bt is a recognized BattleTypeFilter value.
+func ValidBattleType(bt BattleTypeFilter) bool {
+	switch bt {
+	case BattleTypeRanked, BattleTypeSoloRanked, BattleTypeCompetitive, BattleTypeAny:
+		return true
+	}
+	return false
+}
+
+// battleTypeSQL returns a SQL WHERE fragment for the given filter.
+// Values are SQL literals (not parameters) because battle_type values are a fixed
+// enum validated before this function is called -- no user input reaches the SQL directly.
+func battleTypeSQL(bt BattleTypeFilter) string {
+	switch bt {
+	case BattleTypeRanked:
+		return " AND b.battle_type = 'ranked'"
+	case BattleTypeSoloRanked:
+		return " AND b.battle_type = 'soloRanked'"
+	case BattleTypeCompetitive:
+		return " AND b.battle_type IN ('ranked', 'soloRanked')"
+	default: // BattleTypeAny
+		return ""
+	}
+}
+
 // BrawlerWinRate holds per-brawler win-rate data for a single mode query.
 type BrawlerWinRate struct {
 	BrawlerID int
@@ -37,8 +87,10 @@ type BrawlerWinRate struct {
 // WinRateParams configures a BrawlerWinRates query.
 type WinRateParams struct {
 	Mode                string
-	BrawlerTrophyBucket *int16 // nil means no bucket filter (all tiers combined)
-	MinBattles          int    // brawler must appear in at least this many distinct battles
+	Map                 *string          // nil means all maps combined
+	BattleType          BattleTypeFilter // default BattleTypeRanked; never empty after validation
+	BrawlerTrophyBucket *int16           // nil means no bucket filter (all tiers combined)
+	MinBattles          int              // brawler must appear in at least this many distinct battles
 }
 
 // WinRateResult is the output of BrawlerWinRates.
@@ -49,8 +101,10 @@ type WinRateResult struct {
 
 // BrawlerWinRates returns per-brawler win rates for a 3v3 mode.
 //
-// Eligible rows are those with bt.result IN ('victory','defeat','draw') and a non-null
-// brawler_id. Draws are reported separately and excluded from the win_pct denominator:
+// Eligible rows: bt.result IN ('victory','defeat','draw'), non-null brawler_id,
+// and battle_type matching p.BattleType (default: 'ranked' only).
+//
+// Draws are reported separately and excluded from the win_pct denominator:
 // win_pct = wins / (wins + losses).
 //
 // Returns an error for rank-based or attribution-free modes (soloShowdown, duoShowdown,
@@ -62,24 +116,37 @@ func BrawlerWinRates(ctx context.Context, pool *pgxpool.Pool, p WinRateParams) (
 			p.Mode,
 		)
 	}
+	if p.BattleType == "" {
+		p.BattleType = BattleTypeRanked
+	}
 	minBattles := p.MinBattles
 	if minBattles < 1 {
 		minBattles = 1
 	}
 
-	// baseArgs and bucketClause are shared between the count and main queries.
-	// $1 is always mode; $2 is brawler_trophy_bucket when provided.
+	// Build dynamic WHERE fragments.
+	// battle_type clause is a safe SQL literal (controlled enum, validated before call).
+	// bucket and map clauses use positional parameters ($N) for user-supplied values.
+	btClause := battleTypeSQL(p.BattleType)
 	baseArgs := []any{p.Mode}
+
 	bucketClause := ""
 	if p.BrawlerTrophyBucket != nil {
 		baseArgs = append(baseArgs, *p.BrawlerTrophyBucket)
-		bucketClause = " AND bp.trophy_bucket = $2"
+		bucketClause = fmt.Sprintf(" AND bp.trophy_bucket = $%d", len(baseArgs))
 	}
 
-	const baseWhere = `
+	mapClause := ""
+	if p.Map != nil {
+		baseArgs = append(baseArgs, *p.Map)
+		mapClause = fmt.Sprintf(" AND b.event_map = $%d", len(baseArgs))
+	}
+
+	baseWhere := `
         WHERE b.event_mode = $1
           AND bp.brawler_id IS NOT NULL
-          AND bt.result IN ('victory', 'defeat', 'draw')`
+          AND bt.result IN ('victory', 'defeat', 'draw')` +
+		btClause + bucketClause + mapClause
 
 	const baseJoins = `
         FROM battle_participants bp
@@ -87,16 +154,15 @@ func BrawlerWinRates(ctx context.Context, pool *pgxpool.Pool, p WinRateParams) (
         JOIN battles b       ON b.id  = bp.battle_id`
 
 	// Count distinct eligible battles in the filtered population.
-	// This is the denominator for sample_battles in the API response.
 	var sampleBattles int
 	if err := pool.QueryRow(ctx,
-		`SELECT COUNT(DISTINCT b.id)`+baseJoins+baseWhere+bucketClause,
+		`SELECT COUNT(DISTINCT b.id)`+baseJoins+baseWhere,
 		baseArgs...,
 	).Scan(&sampleBattles); err != nil {
 		return WinRateResult{}, fmt.Errorf("count eligible battles: %w", err)
 	}
 
-	// Per-brawler aggregation. minBattles is the last argument.
+	// Per-brawler aggregation. minBattles is appended last.
 	mainArgs := make([]any, len(baseArgs)+1)
 	copy(mainArgs, baseArgs)
 	mainArgs[len(baseArgs)] = minBattles
@@ -112,7 +178,7 @@ func BrawlerWinRates(ctx context.Context, pool *pgxpool.Pool, p WinRateParams) (
            SUM(CASE WHEN bt.result = 'draw'    THEN 1 ELSE 0 END)                 AS draws`+
 			baseJoins+`
         JOIN brawlers br ON br.id = bp.brawler_id`+
-			baseWhere+bucketClause+`
+			baseWhere+`
         GROUP BY br.id, br.name
         HAVING COUNT(DISTINCT b.id) >= `+havingN+`
         ORDER BY
