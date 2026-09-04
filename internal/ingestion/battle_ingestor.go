@@ -137,43 +137,42 @@ func (b *BattleIngestor) IngestBattle(ctx context.Context, entry apiclient.Battl
 
 	switch {
 	case len(entry.Battle.Teams) > 0:
+		// Team rows and participant rows are written unconditionally (not gated on
+		// IsNew) so that re-collection repairs already-stored battles that are
+		// missing participant rows due to past ingestion failures. InsertBattleTeam
+		// uses ON CONFLICT DO UPDATE (idempotent, always returns the team ID).
+		// InsertBattleParticipant uses ON CONFLICT DO NOTHING (idempotent).
 		hasParticipantRows = true
 		for teamIdx, team := range entry.Battle.Teams {
-			var teamID int64
-			if bResult.IsNew {
-				teamResult := teamResults[teamIdx]
-				var err error
-				teamID, err = queries.InsertBattleTeam(ctx, b.pool, bResult.BattleID, teamIdx, teamResult)
-				if err != nil {
-					return IngestResult{}, fmt.Errorf("insert team %d: %w", teamIdx, err)
-				}
+			teamResult := teamResults[teamIdx]
+			teamID, err := queries.InsertBattleTeam(ctx, b.pool, bResult.BattleID, teamIdx, teamResult)
+			if err != nil {
+				return IngestResult{}, fmt.Errorf("insert team %d: %w", teamIdx, err)
 			}
 
 			for _, p := range team {
 				normalTag := apiclient.NormalizeTag(p.Tag)
 
-				if bResult.IsNew {
-					isStarPlayer := starPlayerTag != nil && *starPlayerTag == normalTag
-					bucket := domain.BucketForTrophies(p.Brawler.Trophies)
-					b16 := int16(bucket)
-					if p.Brawler.ID != 0 {
-						if err := queries.EnsureRetiredBrawler(ctx, b.pool, p.Brawler.ID, p.Brawler.Name); err != nil {
-							return IngestResult{}, fmt.Errorf("ensure brawler %d for participant %s: %w", p.Brawler.ID, normalTag, err)
-						}
+				isStarPlayer := starPlayerTag != nil && *starPlayerTag == normalTag
+				bucket := domain.BucketForTrophies(p.Brawler.Trophies)
+				b16 := int16(bucket)
+				if p.Brawler.ID != 0 {
+					if err := queries.EnsureRetiredBrawler(ctx, b.pool, p.Brawler.ID, p.Brawler.Name); err != nil {
+						return IngestResult{}, fmt.Errorf("ensure brawler %d for participant %s: %w", p.Brawler.ID, normalTag, err)
 					}
-					if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
-						BattleID:        bResult.BattleID,
-						TeamID:          &teamID,
-						PlayerTag:       normalTag,
-						PlayerName:      p.Name,
-						BrawlerID:       intPtr(p.Brawler.ID),
-						BrawlerPower:    intPtr(p.Brawler.Power),
-						BrawlerTrophies: intPtr(p.Brawler.Trophies),
-						IsStarPlayer:    isStarPlayer,
-						TrophyBucket:    &b16,
-					}); err != nil {
-						return IngestResult{}, fmt.Errorf("insert participant %s: %w", normalTag, err)
-					}
+				}
+				if err := queries.InsertBattleParticipant(ctx, b.pool, queries.ParticipantParams{
+					BattleID:        bResult.BattleID,
+					TeamID:          &teamID,
+					PlayerTag:       normalTag,
+					PlayerName:      p.Name,
+					BrawlerID:       intPtr(p.Brawler.ID),
+					BrawlerPower:    intPtr(p.Brawler.Power),
+					BrawlerTrophies: intPtr(p.Brawler.Trophies),
+					IsStarPlayer:    isStarPlayer,
+					TrophyBucket:    &b16,
+				}); err != nil {
+					return IngestResult{}, fmt.Errorf("insert participant %s: %w", normalTag, err)
 				}
 
 				newDiscoveries = b.discoverPlayer(ctx, normalTag, p.Name, newDiscoveries)
